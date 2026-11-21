@@ -92,6 +92,7 @@ static void arena_init(size_t c) {
   g_arena_cap = c;
   void* m = mmap(nullptr, c, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
   if (m == MAP_FAILED) { fprintf(stderr, "arena mmap failed\n"); exit(1); }
+  madvise(m, c, MADV_HUGEPAGE);  // 2 MB pages: far fewer faults and a faster teardown where THP is available
   g_arena = (char*)m;
 }
 static void* block_alloc() {
