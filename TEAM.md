@@ -2,4 +2,4 @@
 
 Name:
 Members:
-Engine: DuckDB
+Engine: C++20 (static binary, hand-written parser and Parquet writer)
