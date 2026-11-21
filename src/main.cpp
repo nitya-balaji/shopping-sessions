@@ -963,48 +963,77 @@ int main(int argc, char** argv) {
   for (auto& a : cagg) { size_t z = (size_t)(NC + 1) * ndays; a.sess.assign(z, 0); a.purch.assign(z, 0); a.rev.assign(z, 0); a.assist.assign(z, 0); }
   struct URow { const char* name; u32 n; int32_t day; i64 sessions, events, rev; int32_t top; };
   vector<vector<URow>> urows(NT);
-  vector<vector<Ev>> ev_scratch(NT);
-  vector<vector<Ck>> ck_scratch(NT);
+  struct PKey { u64 h; u32 n; u32 id; };
+  struct Scratch {
+    vector<PKey> ptab; vector<u32> epid, cpid, cnt, ccnt, eoff, coff, fill;
+    vector<Ev> ev; vector<Ck> ck;
+    vector<i64> catsum; vector<int> camp_cnt, active_pos; vector<u32> active;
+  };
+  vector<Scratch> scratch(NT);
 
   parallel_for(S, [&](size_t s, int tid) {
-    vector<Ev>& ev = ev_scratch[tid]; vector<Ck>& ck = ck_scratch[tid];
-    ev.clear(); ck.clear();
-    for (int t = 0; t < NT; t++) ev_buf[t][s].append_to(ev);
-    for (int t = 0; t < NT; t++) ck_buf[t][s].append_to(ck);
-    if (ev.empty()) return;
-    // Person identity inside a shard = (64-bit hash of the name, name length). Comparing names byte by
-    // byte here would touch a random input line per event; a false match needs a 64-bit hash collision
-    // between two equal-length names in the same shard (probability ~1e-9 at 60M events).
-    auto pkey_cmp = [](u64 ah, const char*, u32 an, u64 bh, const char*, u32 bn) -> int {
-      if (ah != bh) return ah < bh ? -1 : 1;
-      if (an != bn) return an < bn ? -1 : 1;
-      return 0;
+    // Group this shard's records by person with a small hash table + counting sort, then sort each
+    // person's few events by ts. Person identity = (64-bit name hash, name length): comparing bytes
+    // would touch a random input line per event (see SOLUTION.md for the collision bound).
+    size_t ne = 0, nc = 0;
+    for (int t = 0; t < NT; t++) { ne += ev_buf[t][s].total; nc += ck_buf[t][s].total; }
+    if (!ne) return;
+    Scratch& sc = scratch[tid];
+    size_t cap = 16; while (cap < 2 * ne) cap <<= 1;
+    const u64 m = cap - 1;
+    sc.ptab.assign(cap, PKey{0, 0, UINT32_MAX});
+    sc.epid.resize(ne); sc.cnt.clear();
+    auto pfind = [&](u64 h, u32 n, bool insert) -> u32 {
+      for (u64 j = (h >> 9) & m;; j = (j + 1) & m) {
+        PKey& e = sc.ptab[j];
+        if (e.id == UINT32_MAX) {
+          if (!insert) return UINT32_MAX;
+          e = PKey{h, n, (u32)sc.cnt.size()}; sc.cnt.push_back(0); return e.id;
+        }
+        if (e.h == h && e.n == n) return e.id;
+      }
     };
-    std::sort(ev.begin(), ev.end(), [&](const Ev& a, const Ev& b) {
-      if (a.ph != b.ph) return a.ph < b.ph;
-      if (ref_n(a.nref) != ref_n(b.nref)) return ref_n(a.nref) < ref_n(b.nref);
-      return a.ts < b.ts;
-    });
-    std::sort(ck.begin(), ck.end(), [&](const Ck& a, const Ck& b) {
-      if (a.ph != b.ph) return a.ph < b.ph;
-      if (a.name_n != b.name_n) return a.name_n < b.name_n;
-      if (a.ts != b.ts) return a.ts < b.ts;
-      return bytecmp(a.cid, a.cid_n, b.cid, b.cid_n) < 0;
-    });
+    size_t q = 0;
+    for (int t = 0; t < NT; t++) ev_buf[t][s].each([&](const Ev& x) { u32 p = pfind(x.ph, ref_n(x.nref), true); sc.epid[q++] = p; sc.cnt[p]++; });
+    const u32 P = (u32)sc.cnt.size();
+    sc.eoff.resize(P + 1); sc.eoff[0] = 0;
+    for (u32 p = 0; p < P; p++) sc.eoff[p + 1] = sc.eoff[p] + sc.cnt[p];
+    sc.fill.assign(sc.eoff.begin(), sc.eoff.end() - 1);
+    sc.ev.resize(ne);
+    q = 0;
+    for (int t = 0; t < NT; t++) ev_buf[t][s].each([&](const Ev& x) { sc.ev[sc.fill[sc.epid[q++]]++] = x; });
+    // clicks of persons that have events (others cannot credit or assist anything)
+    sc.cpid.resize(nc);
+    sc.ccnt.assign(P, 0);
+    q = 0;
+    for (int t = 0; t < NT; t++) ck_buf[t][s].each([&](const Ck& x) { u32 p = pfind(x.ph, x.name_n, false); sc.cpid[q++] = p; if (p != UINT32_MAX) sc.ccnt[p]++; });
+    sc.coff.resize(P + 1); sc.coff[0] = 0;
+    for (u32 p = 0; p < P; p++) sc.coff[p + 1] = sc.coff[p] + sc.ccnt[p];
+    sc.fill.assign(sc.coff.begin(), sc.coff.end() - 1);
+    sc.ck.resize(sc.coff[P]);
+    q = 0;
+    for (int t = 0; t < NT; t++) ck_buf[t][s].each([&](const Ck& x) { u32 p = sc.cpid[q++]; if (p != UINT32_MAX) sc.ck[sc.fill[p]++] = x; });
+    vector<Ev>& ev = sc.ev; vector<Ck>& ck = sc.ck;
+    auto ev_less = [](const Ev& a, const Ev& b) { return a.ts < b.ts; };
+    auto ck_less = [](const Ck& a, const Ck& b) { return a.ts != b.ts ? a.ts < b.ts : bytecmp(a.cid, a.cid_n, b.cid, b.cid_n) < 0; };
+    for (u32 p = 0; p < P; p++) {
+      Ev* e0 = ev.data() + sc.eoff[p]; Ev* e1 = ev.data() + sc.eoff[p + 1];
+      if (e1 - e0 > 1) {
+        if (e1 - e0 <= 16) { for (Ev* x = e0 + 1; x < e1; x++) { Ev v = *x; Ev* y = x; while (y > e0 && v.ts < (y - 1)->ts) { *y = *(y - 1); y--; } *y = v; } }
+        else std::sort(e0, e1, ev_less);
+      }
+      Ck* c0 = ck.data() + sc.coff[p]; Ck* c1 = ck.data() + sc.coff[p + 1];
+      if (c1 - c0 > 1) std::sort(c0, c1, ck_less);
+    }
     CampAgg& ca = cagg[tid];
     auto& ur = urows[tid];
-    vector<i64> catsum(NCAT, 0);
-    vector<int> camp_cnt(NC, 0);
-    vector<u32> active; vector<int> active_pos(NC, -1);
-    size_t ci = 0, i = 0;
-    while (i < ev.size()) {
-      size_t j = i + 1;
-      while (j < ev.size() && pkey_cmp(ev[i].ph, nullptr, ref_n(ev[i].nref), ev[j].ph, nullptr, ref_n(ev[j].nref)) == 0) j++;
-      // this person's clicks
-      while (ci < ck.size() && pkey_cmp(ck[ci].ph, nullptr, ck[ci].name_n, ev[i].ph, nullptr, ref_n(ev[i].nref)) < 0) ci++;
-      size_t c0 = ci, c1 = ci;
-      while (c1 < ck.size() && pkey_cmp(ck[c1].ph, nullptr, ck[c1].name_n, ev[i].ph, nullptr, ref_n(ev[i].nref)) == 0) c1++;
-      ci = c1;
+    vector<i64>& catsum = sc.catsum; catsum.assign(NCAT, 0);
+    vector<int>& camp_cnt = sc.camp_cnt; camp_cnt.assign(NC, 0);
+    vector<u32>& active = sc.active; active.clear();
+    vector<int>& active_pos = sc.active_pos; active_pos.assign(NC, -1);
+    for (u32 p = 0; p < P; p++) {
+      const size_t i = sc.eoff[p], j = sc.eoff[p + 1];
+      const size_t c0 = sc.coff[p], c1 = sc.coff[p + 1];
       size_t lo = c0, hi = c0;  // window [lo,hi) of clicks with s-7d <= ts <= s
       // user-day accumulation
       int32_t cur_day = INT32_MIN; i64 u_sess = 0, u_ev = 0, u_rev = 0; bool u_purch = false;
@@ -1070,7 +1099,6 @@ int main(int argc, char** argv) {
       // reset window state
       for (u32 cp : active) { camp_cnt[cp] = 0; active_pos[cp] = -1; }
       active.clear();
-      i = j;
     }
   });
 
