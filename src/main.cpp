@@ -255,18 +255,19 @@ static inline bool split_fields(const char* s, const char* e, SV* out, int k) {
 // has K-1 commas and every quote is the first or last byte of a field wrapped in a pair of quotes.
 template <int K> static inline bool fields_from_masks(const char* p, u32 len, u64 c0, u64 c1, u64 q0, u64 q1, SV* f) {
   if (__builtin_popcountll(c0) + __builtin_popcountll(c1) != K - 1) return false;
-  // field boundaries: K-1 comma positions, then len
+  // field boundaries: exactly K-1 comma positions (fixed trip count, no data-dependent branches), then len
   u32 ends[K];
-  int k = 0;
-  while (c0) { ends[k++] = (u32)__builtin_ctzll(c0); c0 &= c0 - 1; }
-  while (c1) { ends[k++] = 64 + (u32)__builtin_ctzll(c1); c1 &= c1 - 1; }
+  for (int k = 0; k < K - 1; k++) {
+    const bool lo = c0 != 0;
+    const u64 w = lo ? c0 : c1;
+    const u32 bit = (u32)__builtin_ctzll(w | (1ULL << 63));  // w != 0 here; the OR keeps ctz defined
+    ends[k] = bit + (lo ? 0 : 64);
+    const u64 cleared = w & (w - 1);
+    c0 = lo ? cleared : c0;
+    c1 = lo ? c1 : cleared;
+  }
   ends[K - 1] = len;
   const u32 nq = (u32)(__builtin_popcountll(q0) + __builtin_popcountll(q1));
-  if (nq == 0) {  // common fast path: no quotes at all
-    u32 a = 0;
-    for (int i = 0; i < K; i++) { f[i] = {p + a, ends[i] - a}; a = ends[i] + 1; }
-    return true;
-  }
   // branch-free, from the masks: a field is quoted iff its first byte is '"'; then its last byte must
   // be '"' too and n >= 2. Every quote in the line must be one of these.
   auto qbit = [&](u32 x) -> u32 { u64 w = x < 64 ? q0 : q1; return (u32)((w >> (x & 63)) & 1); };
