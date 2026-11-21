@@ -141,7 +141,18 @@ template <class T> struct BList {
     }
   }
   inline void finish() { flush_stage(); if (tail) tail->n = tn; }
-  template <class F> inline void each(F f) const { for (Blk* b = head; b; b = b->next) { const T* it = b->items(); for (u32 i = 0; i < b->n; i++) f(it[i]); } }
+  template <class F> inline void each(F f) const {
+    for (Blk* b = head; b; b = b->next) {
+      if (b->next) _mm_prefetch((const char*)b->next, _MM_HINT_T0);
+      const T* it = b->items();
+      const char* end = (const char*)(it + b->n);
+      for (u32 i = 0; i < b->n; i++) {
+        const char* ahead = (const char*)(it + i) + 1024;  // stream ahead within the block
+        if (ahead < end) _mm_prefetch(ahead, _MM_HINT_T0);
+        f(it[i]);
+      }
+    }
+  }
   inline void append_to(vector<T>& v) const { for (Blk* b = head; b; b = b->next) v.insert(v.end(), b->items(), b->items() + b->n); }
   // hand every block to the calling thread's free list (the list must not be used afterwards)
   inline void recycle() { for (Blk* b = head; b;) { Blk* n = b->next; if (tl_free) tl_free->push_back(b); b = n; } head = tail = nullptr; total = 0; dst = nullptr; soff = 0; tn = CAP; }
@@ -284,9 +295,16 @@ template <int K> static inline bool fields_from_masks(const char* p, u32 len, u6
   }
   return ok && nq == bq;
 }
+static const bool POPULATE = getenv("SS_NOPOP") == nullptr;
+static const int PF_DIST = getenv("SS_PFD") ? atoi(getenv("SS_PFD")) : 1024;  // input prefetch distance (bytes)
 template <int K, class F> static inline void scan_lines(const Chunk& c, F fn) {
   const char* base = c.base;
   const size_t n = c.fsize;
+  if (POPULATE) {  // map this chunk's file pages in one call instead of one fault per few pages
+    uintptr_t a0 = (uintptr_t)(base + c.b) & ~(uintptr_t)4095;
+    uintptr_t a1 = std::min((uintptr_t)(base + n), (uintptr_t)(base + c.e) + 8192);
+    if (a1 > a0) madvise((void*)a0, a1 - a0, 22 /* MADV_POPULATE_READ */);
+  }
   size_t pos;
   {
     const char* nl = (const char*)memchr(base + (c.b ? c.b - 1 : 0), '\n', n - (c.b ? c.b - 1 : 0));
@@ -297,6 +315,10 @@ template <int K, class F> static inline void scan_lines(const Chunk& c, F fn) {
   SV f[K];
   while (pos < c.e) {
     const char* p = base + pos;
+    // The hardware prefetcher stops at 4 KB boundaries; pull the input in ~1 KB ahead ourselves.
+    // (Prefetches never fault, so running past the end of the mapping is harmless.)
+    _mm_prefetch(p + PF_DIST, _MM_HINT_T0);
+    _mm_prefetch(p + PF_DIST + 64, _MM_HINT_T0);
     if (pos + 128 <= n) {
       __m256i x0 = _mm256_loadu_si256((const __m256i*)p), x1 = _mm256_loadu_si256((const __m256i*)(p + 32));
       u64 n0 = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x0, vn)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x1, vn)) << 32);
@@ -1007,6 +1029,7 @@ int main(int argc, char** argv) {
       const EL::Blk* b = (const EL::Blk*)blks[bi];
       const ERaw* it = b->items();
       for (u32 k = 0; k < b->n; k++) {
+        if (k + 26 < b->n) _mm_prefetch((const char*)(it + k + 26), _MM_HINT_T0);  // ~1 KB ahead
         const ERaw& r = it[k];
         const u32 i = bi * EL::CAP + k;
         for (u64 j = (r.h_eid >> 20) & mask;; j = (j + 1) & mask) {
