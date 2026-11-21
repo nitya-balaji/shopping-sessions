@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <cstddef>
 #include <dirent.h>
 #include <fcntl.h>
 #include <immintrin.h>
@@ -103,23 +104,45 @@ static void* block_alloc() {
   }
   void* r = tl_cur; tl_cur += BLK_BYTES; return r;
 }
-template <class T> struct BList {  // append-only list of 16 KB blocks; items never move
-  static const u32 CAP = (u32)((BLK_BYTES - 16) / sizeof(T));
-  struct Blk { Blk* next; u32 n; u32 pad; T items[CAP]; };
-  static_assert(sizeof(Blk) <= BLK_BYTES);
+// Append-only list of 16 KB blocks; items never move. Pushes are staged in a small cached buffer and
+// written to the block in whole 256-byte chunks with non-temporal stores (no read-for-ownership miss).
+// After the writing phase: the writer calls _mm_sfence(), then finish() publishes the staged tail.
+template <class T> struct BList {
+  static const u32 HDR = 64;
+  static const u32 AREA = (u32)(((BLK_BYTES - HDR) / 256) * 256);
+  static const u32 CAP = (u32)(AREA / sizeof(T));
+  struct Blk {
+    Blk* next; u32 n; u32 pad[13];
+    alignas(64) char data[AREA];
+    inline T* items() { return (T*)data; }
+    inline const T* items() const { return (const T*)data; }
+  };
+  static_assert(sizeof(Blk) <= BLK_BYTES && offsetof(Blk, data) == HDR);
   Blk* head = nullptr; Blk* tail = nullptr; size_t total = 0;
+  char* dst = nullptr; u32 soff = 0;
+  alignas(64) char stage[256 + sizeof(T)];
+  inline void flush_stage() { if (soff) { memcpy(dst, stage, soff); soff = 0; } }
   inline void push(const T& x) {
     if (!tail || tail->n == CAP) {
+      flush_stage();
       Blk* b = (Blk*)block_alloc(); b->next = nullptr; b->n = 0;
       if (tail) tail->next = b; else head = b;
-      tail = b;
+      tail = b; dst = b->data;
     }
-    tail->items[tail->n++] = x; total++;
+    memcpy(stage + soff, &x, sizeof(T)); soff += sizeof(T);
+    tail->n++; total++;
+    if (soff >= 256) {
+      for (int i = 0; i < 8; i++)
+        _mm256_stream_si256((__m256i*)(dst + 32 * i), _mm256_load_si256((const __m256i*)(stage + 32 * i)));
+      dst += 256; soff -= 256;
+      if (soff) memcpy(stage, stage + 256, soff);
+    }
   }
-  template <class F> inline void each(F f) const { for (Blk* b = head; b; b = b->next) for (u32 i = 0; i < b->n; i++) f(b->items[i]); }
-  inline void append_to(vector<T>& v) const { for (Blk* b = head; b; b = b->next) v.insert(v.end(), b->items, b->items + b->n); }
+  inline void finish() { flush_stage(); }
+  template <class F> inline void each(F f) const { for (Blk* b = head; b; b = b->next) { const T* it = b->items(); for (u32 i = 0; i < b->n; i++) f(it[i]); } }
+  inline void append_to(vector<T>& v) const { for (Blk* b = head; b; b = b->next) v.insert(v.end(), b->items(), b->items() + b->n); }
   // hand every block to the calling thread's free list (the list must not be used afterwards)
-  inline void recycle() { for (Blk* b = head; b;) { Blk* n = b->next; if (tl_free) tl_free->push_back(b); b = n; } head = tail = nullptr; total = 0; }
+  inline void recycle() { for (Blk* b = head; b;) { Blk* n = b->next; if (tl_free) tl_free->push_back(b); b = n; } head = tail = nullptr; total = 0; dst = nullptr; soff = 0; }
 };
 
 // ---------------------------------------------------------------- parallel helper
@@ -723,7 +746,6 @@ int main(int argc, char** argv) {
   lap("mapped");
 
   // ---- links: union-find (runs as one task while the other threads parse events and clicks)
-  StrMap id_map;   // linked id -> index (used while joining)
   struct PSlot { u64 h; u32 n; u32 used; const char* key; Person person; };  // 48 bytes
   vector<PSlot> ptab;  // linked id -> person, one cache line per lookup
   u64 pmask = 0;
@@ -731,17 +753,34 @@ int main(int argc, char** argv) {
     vector<std::pair<SV, SV>> pairs;
     for (auto& f : link_files)
       scan_lines<2>(Chunk{f.p, f.n, 0, f.n}, [&](const SV* x) { if (x[0].n && x[1].n) pairs.push_back({x[0], x[1]}); });
-    id_map.init(2 * pairs.size() + 16);  // up to 2 distinct ids per link
-    vector<SV> ids;
-    vector<u64> hs;
-    vector<u32> parent;
-    ids.reserve(pairs.size() + 16); hs.reserve(pairs.size() + 16); parent.reserve(pairs.size() + 16);
-    auto intern = [&](SV s) {
-      u64 h = hash_bytes(s.p, s.n);
-      bool ins;
-      u32* v = id_map.find_or_insert(h, s.p, s.n, ins);
-      if (ins) { *v = (u32)ids.size(); ids.push_back(s); hs.push_back(h); parent.push_back(*v); }
-      return *v;
+    const size_t np = pairs.size();
+    vector<u64> hsd(2 * np);
+    for (size_t k = 0; k < np; k++) {
+      hsd[2 * k] = hash_bytes(pairs[k].first.p, pairs[k].first.n);
+      hsd[2 * k + 1] = hash_bytes(pairs[k].second.p, pairs[k].second.n);
+    }
+    // id table: identity = 64-bit hash + length (same rule as resolve)
+    struct LS { u64 h; u32 n; u32 v; };
+    size_t cap = 16; while (cap < 3 * np + 16) cap <<= 1;
+    vector<LS> lt(cap, LS{0, 0, UINT32_MAX});
+    const u64 lmask = cap - 1;
+    vector<SV> ids; vector<u64> hs, pre; vector<u32> parent;
+    ids.reserve(np + 16); hs.reserve(np + 16); pre.reserve(np + 16); parent.reserve(np + 16);
+    auto prefix = [](SV s) {  // first 8 bytes, big-endian, zero padded: orders like bytecmp unless equal
+      u64 v = 0;
+      for (u32 i = 0; i < 8; i++) v = (v << 8) | (i < s.n ? (uint8_t)s.p[i] : 0);
+      return v;
+    };
+    auto intern = [&](u64 h, SV s) {
+      for (u64 j = h & lmask;; j = (j + 1) & lmask) {
+        LS& e = lt[j];
+        if (e.v == UINT32_MAX) {
+          e = LS{h, s.n, (u32)ids.size()};
+          ids.push_back(s); hs.push_back(h); pre.push_back(prefix(s)); parent.push_back(e.v);
+          return e.v;
+        }
+        if (e.h == h && e.n == s.n) return e.v;
+      }
     };
     auto find = [&](u32 x) {
       u32 r = x;
@@ -749,22 +788,28 @@ int main(int argc, char** argv) {
       while (parent[x] != r) { u32 n = parent[x]; parent[x] = r; x = n; }
       return r;
     };
-    for (auto& pr : pairs) {
-      u32 a = find(intern(pr.first)), b = find(intern(pr.second));
+    auto less_id = [&](u32 a, u32 b) {
+      if (pre[a] != pre[b]) return pre[a] < pre[b];
+      return bytecmp(ids[a].p, ids[a].n, ids[b].p, ids[b].n) < 0;
+    };
+    const size_t LPF = 16;
+    for (size_t k = 0; k < np; k++) {
+      if (k + LPF < np) { __builtin_prefetch(&lt[hsd[2 * (k + LPF)] & lmask]); __builtin_prefetch(&lt[hsd[2 * (k + LPF) + 1] & lmask]); }
+      u32 a = find(intern(hsd[2 * k], pairs[k].first)), b = find(intern(hsd[2 * k + 1], pairs[k].second));
       if (a == b) continue;
       // root = the one with the smaller id string, so roots name their person
-      if (bytecmp(ids[a].p, ids[a].n, ids[b].p, ids[b].n) < 0) parent[b] = a; else parent[a] = b;
+      if (less_id(a, b)) parent[b] = a; else parent[a] = b;
     }
-    size_t cap = 16; while (cap < ids.size() * 2) cap <<= 1;
-    ptab.assign(cap, PSlot{0, 0, 0, nullptr, {nullptr, 0, 0}});
-    pmask = cap - 1;
+    vector<LS>().swap(lt);
+    size_t pcap = 16; while (pcap < ids.size() * 2) pcap <<= 1;
+    ptab.assign(pcap, PSlot{0, 0, 0, nullptr, {nullptr, 0, 0}});
+    pmask = pcap - 1;
     for (u32 i = 0; i < ids.size(); i++) {
       u32 r = find(i);
       for (u64 j = hs[i] & pmask;; j = (j + 1) & pmask)
         if (!ptab[j].used) { ptab[j] = PSlot{hs[i], ids[i].n, 1, ids[i].p, {ids[r].p, ids[r].n, hs[r]}}; break; }
     }
-    StrMap().t.swap(id_map.t);
-    if (PROF) fprintf(stderr, "links %zu ids %zu\n", pairs.size(), ids.size());
+    if (PROF) fprintf(stderr, "links %zu ids %zu\n", np, ids.size());
     lap("links done");
   };
   auto resolve = [&](u64 h, const char* p, u32 n) -> Person {
@@ -785,6 +830,7 @@ int main(int argc, char** argv) {
     size_t nck = ck_chunks.size();
     parallel_for(1 + nck + ev_chunks.size(), [&](size_t i, int tid) {
       if (i == 0) { do_links(); return; }
+      struct Fence { ~Fence() { _mm_sfence(); } } fence;
       i--;
       if (i < nck) {
         auto& out = cr_buf[tid];
@@ -849,6 +895,7 @@ int main(int argc, char** argv) {
     });
   }
 
+  parallel_for(NT, [&](size_t t, int) { for (auto& l : er_buf[t]) l.finish(); cr_buf[t].finish(); });
   lap("parse events+clicks");
   // ---- dedup events per eid shard, resolve persons (events and clicks) -> person shards
   vector<vector<BList<Ev>>> ev_buf(NT, vector<BList<Ev>>(S));
@@ -858,13 +905,14 @@ int main(int argc, char** argv) {
   vector<vector<void*>> free_lists(NT);
   parallel_for(S + NT, [&](size_t s, int tid) {
     tl_free = &free_lists[tid];
+    struct Fence { ~Fence() { _mm_sfence(); } } fence;
     if (s >= (size_t)S) {  // clicks of one parse thread
       auto& in = cr_buf[s - S];
       auto& out = ck_buf[tid];
       for (auto* b = in.head; b; b = b->next) {
         for (u32 k = 0; k < b->n; k++) {
-          if (k + PF < b->n) __builtin_prefetch(&ptab[b->items[k + PF].uh & pmask]);
-          const CRaw& c = b->items[k];
+          if (k + PF < b->n) __builtin_prefetch(&ptab[b->items()[k + PF].uh & pmask]);
+          const CRaw& c = b->items()[k];
           Person pp = resolve(c.uh, nullptr, c.uid_n);
           out[pp.h % S].push(Ck{pp.h, c.cid, c.ts, c.camp, c.cid_n, (uint16_t)pp.n, 0});
         }
@@ -904,6 +952,7 @@ int main(int argc, char** argv) {
     for (int t = 0; t < NT; t++) er_buf[t][s].recycle();
   });
   for (auto& f : free_lists) vector<void*>().swap(f);
+  parallel_for(NT, [&](size_t t, int) { for (auto& l : ev_buf[t]) l.finish(); for (auto& l : ck_buf[t]) l.finish(); });
   vector<vector<const ERaw*>>().swap(tab_scratch);
 
   lap("dedup");
