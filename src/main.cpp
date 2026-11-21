@@ -35,10 +35,17 @@ static const i64 BAD_TS = INT64_MIN;
 static int NT = 8;
 static auto T0 = std::chrono::steady_clock::now();
 static bool PROF = getenv("SS_PROF") != nullptr;
+static int DEXP = getenv("SS_DEXP") ? atoi(getenv("SS_DEXP")) : 0;
+static std::atomic<unsigned long long> dsink{0};
+#include <sys/resource.h>
 static void lap(const char* what) {
   if (!PROF) return;
+  static double lu = 0, ls = 0;
   double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - T0).count();
-  fprintf(stderr, "%8.1f ms  %s\n", ms, what);
+  rusage ru; getrusage(RUSAGE_SELF, &ru);
+  double u = ru.ru_utime.tv_sec * 1e3 + ru.ru_utime.tv_usec / 1e3, sy = ru.ru_stime.tv_sec * 1e3 + ru.ru_stime.tv_usec / 1e3;
+  fprintf(stderr, "%8.1f ms  %s  cpu+%.0f user +%.0f sys\n", ms, what, u - lu, sy - ls);
+  lu = u; ls = sy;
 }
 
 [[noreturn]] static void die(const char* m) {
@@ -54,8 +61,8 @@ static inline u64 mix64(u64 x) {
 static inline u64 ld8u(const char* p) { u64 v; __builtin_memcpy(&v, p, 8); return v; }
 static inline u32 ld4u(const char* p) { u32 v; __builtin_memcpy(&v, p, 4); return v; }
 // Pure function of the bytes; never reads outside [p, p+n).
-static inline u64 hash_bytes(const char* p, u32 n) {
-  u64 h = 0x9E3779B97F4A7C15ULL ^ (u64(n) * 0xff51afd7ed558ccdULL);
+template <u64 SEED> static inline u64 hash_seeded(const char* p, u32 n) {
+  u64 h = SEED ^ (u64(n) * 0xff51afd7ed558ccdULL);
   if (n >= 8) {
     const char* e = p + n;
     while (e - p > 8) { h = (h ^ mix64(ld8u(p))) * 0x9E3779B97F4A7C15ULL; p += 8; }
@@ -69,41 +76,41 @@ static inline u64 hash_bytes(const char* p, u32 n) {
   }
   return mix64(h);
 }
+static inline u64 hash_bytes(const char* p, u32 n) { return hash_seeded<0x9E3779B97F4A7C15ULL>(p, n); }
+static inline u64 hash_bytes2(const char* p, u32 n) { return hash_seeded<0xC2B2AE3D27D4EB4FULL>(p, n); }
 
-// ---------------------------------------------------------------- arena (huge pages) and block lists
-struct Arena {
-  char* base = nullptr; size_t cap = 0; std::atomic<size_t> off{0};
-  void init(size_t c) {
-    cap = c;
-    void* m = mmap(nullptr, c, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
-    if (m == MAP_FAILED) { fprintf(stderr, "arena mmap failed\n"); exit(1); }
-    base = (char*)m;
-  }
-  void release() { if (base) madvise(base, cap, MADV_DONTNEED); }
-};
-static Arena g_arena[2];  // 0: raw parsed records (freed after dedup), 1: per-person records
-static thread_local char* tl_cur[2] = {nullptr, nullptr};
-static thread_local char* tl_end[2] = {nullptr, nullptr};
-static thread_local size_t tl_gen[2] = {0, 0};
-static size_t g_gen[2] = {1, 1};
-static void* arena_alloc(int a, size_t n) {
-  n = (n + 63) & ~size_t(63);
-  if (tl_gen[a] != g_gen[a] || tl_cur[a] + n > tl_end[a]) {
-    size_t slab = std::max<size_t>(n, 4 << 20);
-    Arena& A = g_arena[a];
-    size_t o = A.off.fetch_add(slab);
-    if (o + slab > A.cap) { fprintf(stderr, "arena exhausted\n"); exit(1); }
-    tl_cur[a] = A.base + o; tl_end[a] = tl_cur[a] + slab; tl_gen[a] = g_gen[a];
-  }
-  void* r = tl_cur[a]; tl_cur[a] += n; return r;
+// ---------------------------------------------------------------- arena of 16 KB blocks, recycled per thread
+static const size_t BLK_BYTES = 16384;
+static char* g_arena = nullptr;
+static size_t g_arena_cap = 0;
+static std::atomic<size_t> g_arena_off{0};
+static thread_local char* tl_cur = nullptr;
+static thread_local char* tl_end = nullptr;
+static thread_local vector<void*>* tl_free = nullptr;  // blocks this thread may reuse (already faulted in)
+static void arena_init(size_t c) {
+  g_arena_cap = c;
+  void* m = mmap(nullptr, c, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+  if (m == MAP_FAILED) { fprintf(stderr, "arena mmap failed\n"); exit(1); }
+  g_arena = (char*)m;
 }
-template <class T, int A> struct BList {  // append-only list of fixed blocks from the arena; items never move
-  static const u32 CAP = (u32)((16384 - 16) / sizeof(T));
+static void* block_alloc() {
+  if (tl_free && !tl_free->empty()) { void* b = tl_free->back(); tl_free->pop_back(); return b; }
+  if (tl_cur == tl_end) {
+    const size_t slab = 4 << 20;
+    size_t o = g_arena_off.fetch_add(slab);
+    if (o + slab > g_arena_cap) { fprintf(stderr, "arena exhausted\n"); exit(1); }
+    tl_cur = g_arena + o; tl_end = tl_cur + slab;
+  }
+  void* r = tl_cur; tl_cur += BLK_BYTES; return r;
+}
+template <class T> struct BList {  // append-only list of 16 KB blocks; items never move
+  static const u32 CAP = (u32)((BLK_BYTES - 16) / sizeof(T));
   struct Blk { Blk* next; u32 n; u32 pad; T items[CAP]; };
+  static_assert(sizeof(Blk) <= BLK_BYTES);
   Blk* head = nullptr; Blk* tail = nullptr; size_t total = 0;
   inline void push(const T& x) {
     if (!tail || tail->n == CAP) {
-      Blk* b = (Blk*)arena_alloc(A, sizeof(Blk)); b->next = nullptr; b->n = 0;
+      Blk* b = (Blk*)block_alloc(); b->next = nullptr; b->n = 0;
       if (tail) tail->next = b; else head = b;
       tail = b;
     }
@@ -111,6 +118,8 @@ template <class T, int A> struct BList {  // append-only list of fixed blocks fr
   }
   template <class F> inline void each(F f) const { for (Blk* b = head; b; b = b->next) for (u32 i = 0; i < b->n; i++) f(b->items[i]); }
   inline void append_to(vector<T>& v) const { for (Blk* b = head; b; b = b->next) v.insert(v.end(), b->items, b->items + b->n); }
+  // hand every block to the calling thread's free list (the list must not be used afterwards)
+  inline void recycle() { for (Blk* b = head; b;) { Blk* n = b->next; if (tl_free) tl_free->push_back(b); b = n; } head = tail = nullptr; total = 0; }
 };
 
 // ---------------------------------------------------------------- parallel helper
@@ -433,12 +442,24 @@ static inline int bytecmp(const char* a, u32 an, const char* b, u32 bn) {
 
 // ---------------------------------------------------------------- records
 struct Person { const char* p; u32 n; u64 h; };
-struct ERaw {  // an event copy after parse, keyed for dedup
-  u64 h_eid; const char* eid; i64 ingest; i64 ts;
-  const char* name; u64 ph; u32 eid_n; u32 name_n; u32 price; uint16_t cat; uint8_t type; uint8_t valid;
+// Pointer (user space, < 2^48) and a 16-bit length packed in one word.
+static inline u64 pack_ref(const char* p, u32 n) { return (u64)(uintptr_t)p | ((u64)n << 48); }
+static inline const char* ref_p(u64 r) { return (const char*)(uintptr_t)(r & 0xFFFFFFFFFFFFULL); }
+static inline u32 ref_n(u64 r) { return (u32)(r >> 48); }
+// Timestamps inside records are u32 milliseconds since TBASE (= window_start - 7 days).
+struct ERaw {  // an event copy after parse, keyed for dedup (40 bytes)
+  u64 h_eid;      // event_id hash; identity = h_eid + chk (see SOLUTION.md)
+  u64 uh;         // user_id hash
+  u64 uref;       // user_id pointer + length
+  int32_t ingest; // ingest_ts in seconds since window_start (clamped to int32)
+  u32 ts;
+  u32 pk;         // price (24 bits) | type << 24 | valid << 26
+  uint16_t cat;
+  uint16_t chk;   // second, independent 16-bit hash of event_id
 };
-struct Ev { u64 ph; const char* name; i64 ts; u32 name_n; u32 price; uint16_t cat; uint8_t type; };
-struct Ck { u64 ph; const char* name; i64 ts; const char* cid; u32 name_n; u32 cid_n; u32 camp; };
+struct Ev { u64 ph; u64 nref; u32 ts; u32 price; uint16_t cat; uint8_t type; uint8_t pad; };  // 32 bytes
+struct Ck { u64 ph; const char* cid; u32 ts; u32 camp; uint16_t cid_n; uint16_t name_n; u32 pad; };  // 32 bytes
+static_assert(sizeof(ERaw) == 40 && sizeof(Ev) == 32 && sizeof(Ck) == 32);
 
 // ---------------------------------------------------------------- Parquet writer
 struct Buf {
@@ -591,14 +612,15 @@ static void sample_start() {
   if (!getenv("SS_SAMPLE")) return;
   g_samp = (uintptr_t*)calloc(MAXSAMP, sizeof(uintptr_t));
   struct sigaction sa{}; sa.sa_sigaction = on_prof; sa.sa_flags = SA_SIGINFO | SA_RESTART;
-  sigaction(SIGPROF, &sa, nullptr);
+  bool user = getenv("SS_SAMPLE_USER") != nullptr;
+  sigaction(user ? SIGVTALRM : SIGPROF, &sa, nullptr);
   itimerval tv{{0, 200}, {0, 200}};
-  setitimer(ITIMER_PROF, &tv, nullptr);
+  setitimer(user ? ITIMER_VIRTUAL : ITIMER_PROF, &tv, nullptr);
 }
 static void sample_stop() {
   const char* path = getenv("SS_SAMPLE");
   if (!path) return;
-  itimerval tv{}; setitimer(ITIMER_PROF, &tv, nullptr);
+  itimerval tv{}; setitimer(ITIMER_PROF, &tv, nullptr); setitimer(ITIMER_VIRTUAL, &tv, nullptr);
   FILE* f = fopen(path, "w");
   size_t n = std::min(g_nsamp.load(), MAXSAMP);
   extern char __executable_start;
@@ -632,6 +654,8 @@ int main(int argc, char** argv) {
     ws = get("\"window_start\""); we = get("\"window_end\"");
   }
   const i64 cws = ws - WEEK_MS;
+  const i64 TBASE = cws;  // record timestamps are u32 ms offsets from here
+  if (we - TBASE >= ((i64)1 << 32)) die("window longer than 42 days is not supported");
   auto floordiv = [](i64 a, i64 b) { return a >= 0 ? a / b : -((-a + b - 1) / b); };
   const i64 day0 = floordiv(ws, DAY_MS);
   const int ndays = (int)(floordiv(we - 1, DAY_MS) - day0 + 1);
@@ -694,14 +718,15 @@ int main(int argc, char** argv) {
   {
     size_t in_bytes = 0;
     for (auto* v : {&link_files, &click_files, &event_files}) for (auto& f : *v) in_bytes += f.n;
-    g_arena[0].init(in_bytes * 2 + ((size_t)1 << 30));
-    g_arena[1].init(in_bytes * 2 + ((size_t)1 << 30));
+    arena_init(in_bytes * 3 + ((size_t)1 << 30));
   }
   lap("mapped");
 
   // ---- links: union-find (runs as one task while the other threads parse events and clicks)
-  StrMap id_map;   // linked id -> index
-  vector<Person> link_person;  // per linked id index: its person's name
+  StrMap id_map;   // linked id -> index (used while joining)
+  struct PSlot { u64 h; u32 n; u32 used; const char* key; Person person; };  // 48 bytes
+  vector<PSlot> ptab;  // linked id -> person, one cache line per lookup
+  u64 pmask = 0;
   auto do_links = [&]() {
     vector<std::pair<SV, SV>> pairs;
     for (auto& f : link_files)
@@ -730,20 +755,30 @@ int main(int argc, char** argv) {
       // root = the one with the smaller id string, so roots name their person
       if (bytecmp(ids[a].p, ids[a].n, ids[b].p, ids[b].n) < 0) parent[b] = a; else parent[a] = b;
     }
-    link_person.resize(ids.size());
-    for (u32 i = 0; i < ids.size(); i++) { u32 r = find(i); link_person[i] = {ids[r].p, ids[r].n, hs[r]}; }
+    size_t cap = 16; while (cap < ids.size() * 2) cap <<= 1;
+    ptab.assign(cap, PSlot{0, 0, 0, nullptr, {nullptr, 0, 0}});
+    pmask = cap - 1;
+    for (u32 i = 0; i < ids.size(); i++) {
+      u32 r = find(i);
+      for (u64 j = hs[i] & pmask;; j = (j + 1) & pmask)
+        if (!ptab[j].used) { ptab[j] = PSlot{hs[i], ids[i].n, 1, ids[i].p, {ids[r].p, ids[r].n, hs[r]}}; break; }
+    }
+    StrMap().t.swap(id_map.t);
     if (PROF) fprintf(stderr, "links %zu ids %zu\n", pairs.size(), ids.size());
     lap("links done");
   };
   auto resolve = [&](u64 h, const char* p, u32 n) -> Person {
-    if (const StrMap::Slot* s = id_map.find(h, p, n)) return link_person[s->v];
-    return {p, n, h};
+    for (u64 j = h & pmask;; j = (j + 1) & pmask) {
+      const PSlot& e = ptab[j];
+      if (!e.used) return {p, n, h};
+      if (e.h == h && e.n == n) return e.person;  // 64-bit hash + length (see SOLUTION.md)
+    }
   };
 
   const int S = 512;  // shards
-  struct CRaw { u64 uh; const char* uid; i64 ts; const char* cid; u32 uid_n, cid_n, camp; };
-  vector<BList<CRaw, 0>> cr_buf(NT);
-  vector<vector<BList<ERaw, 0>>> er_buf(NT, vector<BList<ERaw, 0>>(S));
+  struct CRaw { u64 uh; const char* cid; u32 ts; u32 camp; uint16_t uid_n, cid_n; u32 pad; };  // 32 bytes
+  vector<BList<CRaw>> cr_buf(NT);
+  vector<vector<BList<ERaw>>> er_buf(NT, vector<BList<ERaw>>(S));
   auto ck_chunks = make_chunks(click_files, 4 << 20);
   auto ev_chunks = make_chunks(event_files, 4 << 20);
   {
@@ -759,7 +794,8 @@ int main(int argc, char** argv) {
           if (ts == BAD_TS || ts < cws || ts >= we) return;
           u32 camp = camp_idx.find(f[2].p, f[2].n);
           if (camp == KeyIndex::NONE) return;
-          out.push(CRaw{hash_bytes(f[1].p, f[1].n), f[1].p, ts, f[0].p, f[1].n, f[0].n, camp});
+          if (f[0].n > 0xFFFF || f[1].n > 0xFFFF) die("id longer than 65535 bytes");
+          out.push(CRaw{hash_bytes(f[1].p, f[1].n), f[0].p, (u32)(ts - TBASE), camp, (uint16_t)f[1].n, (uint16_t)f[0].n, 0});
         });
       } else {
         auto& out = er_buf[tid];
@@ -767,12 +803,16 @@ int main(int argc, char** argv) {
           if (f[0].n == 0) return;
           ERaw r;
           r.h_eid = hash_bytes(f[0].p, f[0].n);
-          r.eid = f[0].p; r.eid_n = f[0].n;
-          r.ingest = parse_ts(f[3].p, f[3].n);
-          if (r.ingest == BAD_TS) r.ingest = INT64_MAX;
-          r.valid = 0; r.name = nullptr; r.name_n = 0; r.ph = 0; r.ts = 0; r.price = 0; r.cat = 0; r.type = 0;
+          r.chk = (uint16_t)hash_bytes2(f[0].p, f[0].n);
+          i64 ingest = parse_ts(f[3].p, f[3].n);
+          r.uh = 0; r.uref = 0; r.ts = 0; r.pk = 0; r.cat = 0;
+          if (ingest == BAD_TS) r.ingest = INT32_MAX;
+          else {
+            i64 q = floordiv(ingest - ws, 1000);
+            r.ingest = (int32_t)std::max<i64>(INT32_MIN, std::min<i64>(INT32_MAX - 1, q));
+          }
           do {
-            if (f[1].n == 0 || f[5].n == 0 || r.ingest == INT64_MAX) break;
+            if (f[1].n == 0 || f[5].n == 0 || ingest == BAD_TS) break;
             i64 ts = parse_ts(f[2].p, f[2].n);
             if (ts == BAD_TS || ts < ws || ts >= we) break;
             const SV& t = f[4];
@@ -795,12 +835,13 @@ int main(int argc, char** argv) {
               if (!ok || v < 1) break;
               price = (u32)v;
             }
-            if (r.ingest - ts > DAY_MS) break;
+            if (ingest - ts > DAY_MS) break;
+            if (f[1].n > 0xFFFF) die("id longer than 65535 bytes");
             u32 pc = prod_idx.find(f[5].p, f[5].n);
             r.cat = pc == KeyIndex::NONE ? unknown_cat : (uint16_t)pc;
             // person is resolved after dedup; keep the raw user id here
-            r.name = f[1].p; r.name_n = f[1].n; r.ph = hash_bytes(f[1].p, f[1].n);
-            r.ts = ts; r.price = price; r.type = type; r.valid = 1;
+            r.uref = pack_ref(f[1].p, f[1].n); r.uh = hash_bytes(f[1].p, f[1].n);
+            r.ts = (u32)(ts - TBASE); r.pk = price | ((u32)type << 24) | (1u << 26);
           } while (0);
           out[(r.h_eid >> 7) % S].push(r);
         });
@@ -810,22 +851,25 @@ int main(int argc, char** argv) {
 
   lap("parse events+clicks");
   // ---- dedup events per eid shard, resolve persons (events and clicks) -> person shards
-  vector<vector<BList<Ev, 1>>> ev_buf(NT, vector<BList<Ev, 1>>(S));
-  vector<vector<BList<Ck, 1>>> ck_buf(NT, vector<BList<Ck, 1>>(S));
+  vector<vector<BList<Ev>>> ev_buf(NT, vector<BList<Ev>>(S));
+  vector<vector<BList<Ck>>> ck_buf(NT, vector<BList<Ck>>(S));
   vector<vector<const ERaw*>> tab_scratch(NT);
   const int PF = 12;  // prefetch distance for person lookups
+  vector<vector<void*>> free_lists(NT);
   parallel_for(S + NT, [&](size_t s, int tid) {
+    tl_free = &free_lists[tid];
     if (s >= (size_t)S) {  // clicks of one parse thread
       auto& in = cr_buf[s - S];
       auto& out = ck_buf[tid];
       for (auto* b = in.head; b; b = b->next) {
         for (u32 k = 0; k < b->n; k++) {
-          if (k + PF < b->n) __builtin_prefetch(&id_map.t[b->items[k + PF].uh & id_map.mask]);
+          if (k + PF < b->n) __builtin_prefetch(&ptab[b->items[k + PF].uh & pmask]);
           const CRaw& c = b->items[k];
-          Person pp = resolve(c.uh, c.uid, c.uid_n);
-          out[pp.h % S].push(Ck{pp.h, pp.p, c.ts, c.cid, pp.n, c.cid_n, c.camp});
+          Person pp = resolve(c.uh, nullptr, c.uid_n);
+          out[pp.h % S].push(Ck{pp.h, c.cid, c.ts, c.camp, c.cid_n, (uint16_t)pp.n, 0});
         }
       }
+      in.recycle();
       return;
     }
     size_t n = 0;
@@ -840,23 +884,26 @@ int main(int argc, char** argv) {
         for (u64 i = (r.h_eid >> 20) & mask;; i = (i + 1) & mask) {
           const ERaw*& slot = tab[i];
           if (!slot) { slot = &r; break; }
-          if (slot->h_eid == r.h_eid && slot->eid_n == r.eid_n && memcmp(slot->eid, r.eid, r.eid_n) == 0) {
+          if (slot->h_eid == r.h_eid && slot->chk == r.chk) {
             if (r.ingest < slot->ingest) slot = &r;
             break;
           }
         }
       });
     size_t w = 0;
-    for (const ERaw* r : tab) if (r && r->valid) tab[w++] = r;
+    for (const ERaw* r : tab) if (r && (r->pk >> 26)) tab[w++] = r;
+    if (DEXP == 1) { dsink += w; return; }
+    if (DEXP == 2) { for (size_t k = 0; k < w; k++) { if (k + PF < w) __builtin_prefetch(&ptab[tab[k + PF]->uh & pmask]); dsink += resolve(tab[k]->uh, ref_p(tab[k]->uref), ref_n(tab[k]->uref)).h; } return; }
     auto& out = ev_buf[tid];
     for (size_t k = 0; k < w; k++) {
-      if (k + PF < w) __builtin_prefetch(&id_map.t[tab[k + PF]->ph & id_map.mask]);
+      if (k + PF < w) __builtin_prefetch(&ptab[tab[k + PF]->uh & pmask]);
       const ERaw* r = tab[k];
-      Person pp = resolve(r->ph, r->name, r->name_n);
-      out[pp.h % S].push(Ev{pp.h, pp.p, r->ts, pp.n, r->price, r->cat, r->type});
+      Person pp = resolve(r->uh, ref_p(r->uref), ref_n(r->uref));
+      out[pp.h % S].push(Ev{pp.h, pack_ref(pp.p, pp.n), r->ts, r->pk & 0xFFFFFF, r->cat, (uint8_t)((r->pk >> 24) & 3), 0});
     }
+    for (int t = 0; t < NT; t++) er_buf[t][s].recycle();
   });
-  g_arena[0].release();
+  for (auto& f : free_lists) vector<void*>().swap(f);
   vector<vector<const ERaw*>>().swap(tab_scratch);
 
   lap("dedup");
@@ -886,7 +933,7 @@ int main(int argc, char** argv) {
     };
     std::sort(ev.begin(), ev.end(), [&](const Ev& a, const Ev& b) {
       if (a.ph != b.ph) return a.ph < b.ph;
-      if (a.name_n != b.name_n) return a.name_n < b.name_n;
+      if (ref_n(a.nref) != ref_n(b.nref)) return ref_n(a.nref) < ref_n(b.nref);
       return a.ts < b.ts;
     });
     std::sort(ck.begin(), ck.end(), [&](const Ck& a, const Ck& b) {
@@ -903,11 +950,11 @@ int main(int argc, char** argv) {
     size_t ci = 0, i = 0;
     while (i < ev.size()) {
       size_t j = i + 1;
-      while (j < ev.size() && pkey_cmp(ev[i].ph, ev[i].name, ev[i].name_n, ev[j].ph, ev[j].name, ev[j].name_n) == 0) j++;
+      while (j < ev.size() && pkey_cmp(ev[i].ph, nullptr, ref_n(ev[i].nref), ev[j].ph, nullptr, ref_n(ev[j].nref)) == 0) j++;
       // this person's clicks
-      while (ci < ck.size() && pkey_cmp(ck[ci].ph, ck[ci].name, ck[ci].name_n, ev[i].ph, ev[i].name, ev[i].name_n) < 0) ci++;
+      while (ci < ck.size() && pkey_cmp(ck[ci].ph, nullptr, ck[ci].name_n, ev[i].ph, nullptr, ref_n(ev[i].nref)) < 0) ci++;
       size_t c0 = ci, c1 = ci;
-      while (c1 < ck.size() && pkey_cmp(ck[c1].ph, ck[c1].name, ck[c1].name_n, ev[i].ph, ev[i].name, ev[i].name_n) == 0) c1++;
+      while (c1 < ck.size() && pkey_cmp(ck[c1].ph, nullptr, ck[c1].name_n, ev[i].ph, nullptr, ref_n(ev[i].nref)) == 0) c1++;
       ci = c1;
       size_t lo = c0, hi = c0;  // window [lo,hi) of clicks with s-7d <= ts <= s
       // user-day accumulation
@@ -920,18 +967,18 @@ int main(int argc, char** argv) {
           for (size_t k = 0; k < NCAT; k++) if (catsum[k] > best) { best = catsum[k]; top = (int32_t)k; }
           std::fill(catsum.begin(), catsum.end(), 0);
         }
-        ur.push_back(URow{ev[i].name, ev[i].name_n, cur_day, u_sess, u_ev, u_rev, top});
+        ur.push_back(URow{ref_p(ev[i].nref), ref_n(ev[i].nref), cur_day, u_sess, u_ev, u_rev, top});
       };
       size_t k = i;
       while (k < j) {
-        i64 start = ev[k].ts;
+        i64 start = (i64)ev[k].ts;  // ms since TBASE
         size_t m = k + 1;
-        while (m < j && ev[m].ts - ev[m - 1].ts <= GAP_MS) m++;
+        while (m < j && (i64)ev[m].ts - (i64)ev[m - 1].ts <= GAP_MS) m++;
         // session [k,m)
         i64 srev = 0; bool spurch = false;
         for (size_t q = k; q < m; q++)
           if (ev[q].type == 2) { srev += ev[q].price; spurch = true; catsum[ev[q].cat] += ev[q].price; }
-        int32_t day = (int32_t)floordiv(start, DAY_MS);
+        int32_t day = (int32_t)floordiv(start + TBASE, DAY_MS);
         if (day != cur_day) {
           // flush previous day (catsum belongs to it, so flush before adding this session's sums)
           if (cur_day != INT32_MIN) {
@@ -944,12 +991,12 @@ int main(int argc, char** argv) {
         }
         u_sess++; u_ev += (i64)(m - k); u_rev += srev; u_purch |= spurch;
         // attribution window
-        while (hi < c1 && ck[hi].ts <= start) {
+        while (hi < c1 && (i64)ck[hi].ts <= start) {
           u32 cp = ck[hi].camp;
           if (camp_cnt[cp]++ == 0) { active_pos[cp] = (int)active.size(); active.push_back(cp); }
           hi++;
         }
-        while (lo < hi && ck[lo].ts < start - WEEK_MS) {
+        while (lo < hi && (i64)ck[lo].ts < start - WEEK_MS) {
           u32 cp = ck[lo].camp;
           if (--camp_cnt[cp] == 0) {
             int pos = active_pos[cp]; u32 last = active.back();
@@ -960,7 +1007,7 @@ int main(int argc, char** argv) {
         u32 credit = NC;
         if (hi > lo) {
           size_t a = hi - 1;
-          i64 t = ck[a].ts;
+          u32 t = ck[a].ts;
           while (a > lo && ck[a - 1].ts == t) a--;
           credit = ck[a].camp;
         }
@@ -1023,5 +1070,19 @@ int main(int argc, char** argv) {
   lap("write");
   sample_stop();
   fflush(stdout);
+  if (!getenv("SS_NOFREE")) {
+    // Tearing down ~GBs of mappings at exit runs on one core; release them in parallel first.
+    size_t used = std::min(g_arena_off.load(), g_arena_cap);
+    const size_t piece = 64 << 20;
+    vector<std::pair<char*, size_t>> parts;
+    for (size_t o = 0; o < used; o += piece) parts.push_back({g_arena + o, std::min(piece, used - o)});
+    for (auto* v : {&event_files, &click_files, &link_files})
+      for (auto& f : *v) if (f.n) parts.push_back({(char*)f.p, f.n});
+    parallel_for(parts.size(), [&](size_t i, int) {
+      if (parts[i].first >= g_arena && parts[i].first < g_arena + g_arena_cap) madvise(parts[i].first, parts[i].second, MADV_DONTNEED);
+      else munmap(parts[i].first, parts[i].second);
+    });
+    lap("released");
+  }
   _exit(0);  // skip destructors / munmap
 }

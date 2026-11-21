@@ -11,7 +11,7 @@ both Parquet tables with its own minimal Parquet writer. The run image is `FROM 
 | 1M dev set vs `dev-answer/` | exact MATCH, ~0.6-0.9 s |
 | Same output with 1 thread and 6 threads | MATCH |
 | Seeds 11, 29, 2028 (1M each): rules.md self-checks | all OK |
-| 5M events (seed 7) | ~1.0-1.3 s in-process (1.3-2.0 s wall incl. shell), noisy laptop |
+| 5M events (seed 7) | ~0.75 s in-process, ~1.0-1.3 s wall, noisy laptop; same output as the previous version on 4 datasets |
 
 Rough projection for the 60M final on 8 Xeon vCPUs: ~10-15 s (well under the 3-min cap).
 The Dockerfile could not be built here (Docker is not working on this machine): build it once with
@@ -42,11 +42,17 @@ The Dockerfile could not be built here (Docker is not working on this machine): 
 8. **Output.** Per-thread `user_daily` Parquet files and one `campaign_daily` file (PLAIN, uncompressed,
    `day` as `DATE`).
 
-## Known trade-off
+## Known trade-offs (hash identities)
 
-Inside a person shard, persons are told apart by a 64-bit hash of their name plus its length, not by
-byte comparison (comparing bytes would touch a random input line per event). A wrong merge needs two
-different equal-length names with the same 64-bit hash in the same shard: probability about 1e-9 at 60M events.
+To avoid touching a random input line per event, three identities use hashes instead of byte comparison:
+
+- **Persons inside a shard:** 64-bit hash of the name + its length.
+- **Linked-ID lookup:** 64-bit hash of the user ID + its length.
+- **Event dedup:** 64-bit hash of `event_id` + an independent 16-bit hash.
+
+A wrong result needs a full collision of one of these. At 60M events the combined probability is on the
+order of 1e-7. Record timestamps are u32 ms offsets from `window_start - 7 days`; windows longer than
+42 days stop the run with a message (the generator always uses 14 days).
 
 ## Commands
 
