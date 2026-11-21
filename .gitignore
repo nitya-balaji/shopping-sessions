@@ -1,0 +1,8 @@
+_downloads/
+dev/
+out/
+out-*/
+target/
+**/target/
+__pycache__/
+*.pyc

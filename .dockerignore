@@ -1,0 +1,13 @@
+fixtures/
+dev/
+out/
+*.md
+.git
+_downloads/
+dev-answer/
+generator/
+starters/
+tools/
+target/
+**/target/
+out-*/
