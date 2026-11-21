@@ -11,7 +11,7 @@ both Parquet tables with its own minimal Parquet writer. The run image is `FROM 
 | 1M dev set vs `dev-answer/` | exact MATCH, ~0.6-0.9 s |
 | Same output with 1 thread and 6 threads | MATCH |
 | Seeds 11, 29, 2028 (1M each): rules.md self-checks | all OK |
-| 5M events (seed 7) | ~1.4-1.6 s wall, ~1 GB peak RSS |
+| 5M events (seed 7) | ~1.0-1.3 s in-process (1.3-2.0 s wall incl. shell), noisy laptop |
 
 Rough projection for the 60M final on 8 Xeon vCPUs: ~10-15 s (well under the 3-min cap).
 The Dockerfile could not be built here (Docker is not working on this machine): build it once with
@@ -33,7 +33,8 @@ The Dockerfile could not be built here (Docker is not working on this machine): 
 5. **Event dedup.** Each parsed copy (valid or not) is sent to a shard by `event_id` hash; per shard a
    hash table keeps the copy with the smallest `ingest_ts`, and only then is validity checked
    (dedup before validation). Click duplicates are identical, so they cannot change any output.
-6. **Persons.** Surviving events and valid clicks resolve their user ID to the person name (prefetched
+6. **Persons.** (records live in append-only 16 KB blocks from per-phase arenas: no vector growth or copies; the raw-copy arena is freed right after dedup)
+    Surviving events and valid clicks resolve their user ID to the person name (prefetched
    hash lookups) and are re-sharded by person.
 7. **Sessions.** Per shard, events sort by (person, ts) and clicks by (person, ts, click_id). One pass per
    person builds sessions (gap > 30 min, equal timestamps share), credits the latest click within 7 days

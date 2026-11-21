@@ -51,12 +51,67 @@ static inline u64 mix64(u64 x) {
   x ^= x >> 32; x *= 0xd6e8feb86659fd93ULL; x ^= x >> 32; x *= 0xd6e8feb86659fd93ULL; x ^= x >> 32;
   return x;
 }
+static inline u64 ld8u(const char* p) { u64 v; __builtin_memcpy(&v, p, 8); return v; }
+static inline u32 ld4u(const char* p) { u32 v; __builtin_memcpy(&v, p, 4); return v; }
+// Pure function of the bytes; never reads outside [p, p+n).
 static inline u64 hash_bytes(const char* p, u32 n) {
   u64 h = 0x9E3779B97F4A7C15ULL ^ (u64(n) * 0xff51afd7ed558ccdULL);
-  while (n >= 8) { u64 v; memcpy(&v, p, 8); h = (h ^ mix64(v)) * 0x9E3779B97F4A7C15ULL; p += 8; n -= 8; }
-  if (n) { u64 v = 0; memcpy(&v, p, n); h = (h ^ mix64(v ^ (u64(n) << 56))) * 0x9E3779B97F4A7C15ULL; }
+  if (n >= 8) {
+    const char* e = p + n;
+    while (e - p > 8) { h = (h ^ mix64(ld8u(p))) * 0x9E3779B97F4A7C15ULL; p += 8; }
+    h = (h ^ mix64(ld8u(e - 8) ^ 0x5bd1e995ULL)) * 0x9E3779B97F4A7C15ULL;
+  } else if (n >= 4) {
+    u64 v = (u64)ld4u(p) | ((u64)ld4u(p + n - 4) << 32);
+    h = (h ^ mix64(v)) * 0x9E3779B97F4A7C15ULL;
+  } else if (n > 0) {
+    u64 v = (u64)(uint8_t)p[0] | ((u64)(uint8_t)p[n / 2] << 8) | ((u64)(uint8_t)p[n - 1] << 16);
+    h = (h ^ mix64(v)) * 0x9E3779B97F4A7C15ULL;
+  }
   return mix64(h);
 }
+
+// ---------------------------------------------------------------- arena (huge pages) and block lists
+struct Arena {
+  char* base = nullptr; size_t cap = 0; std::atomic<size_t> off{0};
+  void init(size_t c) {
+    cap = c;
+    void* m = mmap(nullptr, c, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+    if (m == MAP_FAILED) { fprintf(stderr, "arena mmap failed\n"); exit(1); }
+    base = (char*)m;
+  }
+  void release() { if (base) madvise(base, cap, MADV_DONTNEED); }
+};
+static Arena g_arena[2];  // 0: raw parsed records (freed after dedup), 1: per-person records
+static thread_local char* tl_cur[2] = {nullptr, nullptr};
+static thread_local char* tl_end[2] = {nullptr, nullptr};
+static thread_local size_t tl_gen[2] = {0, 0};
+static size_t g_gen[2] = {1, 1};
+static void* arena_alloc(int a, size_t n) {
+  n = (n + 63) & ~size_t(63);
+  if (tl_gen[a] != g_gen[a] || tl_cur[a] + n > tl_end[a]) {
+    size_t slab = std::max<size_t>(n, 4 << 20);
+    Arena& A = g_arena[a];
+    size_t o = A.off.fetch_add(slab);
+    if (o + slab > A.cap) { fprintf(stderr, "arena exhausted\n"); exit(1); }
+    tl_cur[a] = A.base + o; tl_end[a] = tl_cur[a] + slab; tl_gen[a] = g_gen[a];
+  }
+  void* r = tl_cur[a]; tl_cur[a] += n; return r;
+}
+template <class T, int A> struct BList {  // append-only list of fixed blocks from the arena; items never move
+  static const u32 CAP = (u32)((16384 - 16) / sizeof(T));
+  struct Blk { Blk* next; u32 n; u32 pad; T items[CAP]; };
+  Blk* head = nullptr; Blk* tail = nullptr; size_t total = 0;
+  inline void push(const T& x) {
+    if (!tail || tail->n == CAP) {
+      Blk* b = (Blk*)arena_alloc(A, sizeof(Blk)); b->next = nullptr; b->n = 0;
+      if (tail) tail->next = b; else head = b;
+      tail = b;
+    }
+    tail->items[tail->n++] = x; total++;
+  }
+  template <class F> inline void each(F f) const { for (Blk* b = head; b; b = b->next) for (u32 i = 0; i < b->n; i++) f(b->items[i]); }
+  inline void append_to(vector<T>& v) const { for (Blk* b = head; b; b = b->next) v.insert(v.end(), b->items, b->items + b->n); }
+};
 
 // ---------------------------------------------------------------- parallel helper
 template <class F> static void parallel_for(size_t n, F f) {
@@ -520,10 +575,42 @@ static void write_parquet(const string& path, vector<Col>& cols, i64 rows) {
   fclose(fp);
 }
 
+
+// ---------------------------------------------------------------- optional sampling profiler (SS_SAMPLE=path)
+#include <csignal>
+#include <sys/time.h>
+#include <ucontext.h>
+static uintptr_t* g_samp = nullptr;
+static std::atomic<size_t> g_nsamp{0};
+static const size_t MAXSAMP = 1 << 22;
+static void on_prof(int, siginfo_t*, void* ctx) {
+  size_t i = g_nsamp.fetch_add(1, std::memory_order_relaxed);
+  if (i < MAXSAMP) g_samp[i] = (uintptr_t)((ucontext_t*)ctx)->uc_mcontext.gregs[REG_RIP];
+}
+static void sample_start() {
+  if (!getenv("SS_SAMPLE")) return;
+  g_samp = (uintptr_t*)calloc(MAXSAMP, sizeof(uintptr_t));
+  struct sigaction sa{}; sa.sa_sigaction = on_prof; sa.sa_flags = SA_SIGINFO | SA_RESTART;
+  sigaction(SIGPROF, &sa, nullptr);
+  itimerval tv{{0, 200}, {0, 200}};
+  setitimer(ITIMER_PROF, &tv, nullptr);
+}
+static void sample_stop() {
+  const char* path = getenv("SS_SAMPLE");
+  if (!path) return;
+  itimerval tv{}; setitimer(ITIMER_PROF, &tv, nullptr);
+  FILE* f = fopen(path, "w");
+  size_t n = std::min(g_nsamp.load(), MAXSAMP);
+  extern char __executable_start;
+  for (size_t i = 0; i < n; i++) fprintf(f, "%lx\n", (unsigned long)(g_samp[i] - (uintptr_t)&__executable_start));
+  fclose(f);
+}
+
 // ---------------------------------------------------------------- main
 static string env(const char* k, const char* d) { const char* v = getenv(k); return v && *v ? v : d; }
 
 int main(int argc, char** argv) {
+  sample_start();
   string data = env("DATA_DIR", "/data"), outd = env("OUTPUT_DIR", "/output");
   if (argc >= 3) { data = argv[argc - 2]; outd = argv[argc - 1]; }
   NT = atoi(env("NCPU", "0").c_str());
@@ -604,6 +691,12 @@ int main(int argc, char** argv) {
   vector<MFile> link_files = map_all(data + "/links");
   vector<MFile> click_files = map_all(data + "/clicks");
   vector<MFile> event_files = map_all(data + "/events");
+  {
+    size_t in_bytes = 0;
+    for (auto* v : {&link_files, &click_files, &event_files}) for (auto& f : *v) in_bytes += f.n;
+    g_arena[0].init(in_bytes * 2 + ((size_t)1 << 30));
+    g_arena[1].init(in_bytes * 2 + ((size_t)1 << 30));
+  }
   lap("mapped");
 
   // ---- links: union-find (runs as one task while the other threads parse events and clicks)
@@ -649,8 +742,8 @@ int main(int argc, char** argv) {
 
   const int S = 512;  // shards
   struct CRaw { u64 uh; const char* uid; i64 ts; const char* cid; u32 uid_n, cid_n, camp; };
-  vector<vector<CRaw>> cr_buf(NT);
-  vector<vector<vector<ERaw>>> er_buf(NT, vector<vector<ERaw>>(S));
+  vector<BList<CRaw, 0>> cr_buf(NT);
+  vector<vector<BList<ERaw, 0>>> er_buf(NT, vector<BList<ERaw, 0>>(S));
   auto ck_chunks = make_chunks(click_files, 4 << 20);
   auto ev_chunks = make_chunks(event_files, 4 << 20);
   {
@@ -666,7 +759,7 @@ int main(int argc, char** argv) {
           if (ts == BAD_TS || ts < cws || ts >= we) return;
           u32 camp = camp_idx.find(f[2].p, f[2].n);
           if (camp == KeyIndex::NONE) return;
-          out.push_back(CRaw{hash_bytes(f[1].p, f[1].n), f[1].p, ts, f[0].p, f[1].n, f[0].n, camp});
+          out.push(CRaw{hash_bytes(f[1].p, f[1].n), f[1].p, ts, f[0].p, f[1].n, f[0].n, camp});
         });
       } else {
         auto& out = er_buf[tid];
@@ -709,7 +802,7 @@ int main(int argc, char** argv) {
             r.name = f[1].p; r.name_n = f[1].n; r.ph = hash_bytes(f[1].p, f[1].n);
             r.ts = ts; r.price = price; r.type = type; r.valid = 1;
           } while (0);
-          out[(r.h_eid >> 7) % S].push_back(r);
+          out[(r.h_eid >> 7) % S].push(r);
         });
       }
     });
@@ -717,30 +810,33 @@ int main(int argc, char** argv) {
 
   lap("parse events+clicks");
   // ---- dedup events per eid shard, resolve persons (events and clicks) -> person shards
-  vector<vector<vector<Ev>>> ev_buf(NT, vector<vector<Ev>>(S));
-  vector<vector<vector<Ck>>> ck_buf(NT, vector<vector<Ck>>(S));
+  vector<vector<BList<Ev, 1>>> ev_buf(NT, vector<BList<Ev, 1>>(S));
+  vector<vector<BList<Ck, 1>>> ck_buf(NT, vector<BList<Ck, 1>>(S));
+  vector<vector<const ERaw*>> tab_scratch(NT);
   const int PF = 12;  // prefetch distance for person lookups
   parallel_for(S + NT, [&](size_t s, int tid) {
     if (s >= (size_t)S) {  // clicks of one parse thread
       auto& in = cr_buf[s - S];
       auto& out = ck_buf[tid];
-      for (size_t k = 0; k < in.size(); k++) {
-        if (k + PF < in.size()) __builtin_prefetch(&id_map.t[in[k + PF].uh & id_map.mask]);
-        const CRaw& c = in[k];
-        Person pp = resolve(c.uh, c.uid, c.uid_n);
-        out[pp.h % S].push_back(Ck{pp.h, pp.p, c.ts, c.cid, pp.n, c.cid_n, c.camp});
+      for (auto* b = in.head; b; b = b->next) {
+        for (u32 k = 0; k < b->n; k++) {
+          if (k + PF < b->n) __builtin_prefetch(&id_map.t[b->items[k + PF].uh & id_map.mask]);
+          const CRaw& c = b->items[k];
+          Person pp = resolve(c.uh, c.uid, c.uid_n);
+          out[pp.h % S].push(Ck{pp.h, pp.p, c.ts, c.cid, pp.n, c.cid_n, c.camp});
+        }
       }
-      vector<CRaw>().swap(in);
       return;
     }
     size_t n = 0;
-    for (int t = 0; t < NT; t++) n += er_buf[t][s].size();
+    for (int t = 0; t < NT; t++) n += er_buf[t][s].total;
     if (!n) return;
     size_t cap = 16; while (cap < n * 2) cap <<= 1;
-    vector<const ERaw*> tab(cap, nullptr);
+    auto& tab = tab_scratch[tid];
+    tab.assign(cap, nullptr);
     u64 mask = cap - 1;
     for (int t = 0; t < NT; t++)
-      for (const ERaw& r : er_buf[t][s]) {
+      er_buf[t][s].each([&](const ERaw& r) {
         for (u64 i = (r.h_eid >> 20) & mask;; i = (i + 1) & mask) {
           const ERaw*& slot = tab[i];
           if (!slot) { slot = &r; break; }
@@ -749,7 +845,7 @@ int main(int argc, char** argv) {
             break;
           }
         }
-      }
+      });
     size_t w = 0;
     for (const ERaw* r : tab) if (r && r->valid) tab[w++] = r;
     auto& out = ev_buf[tid];
@@ -757,11 +853,11 @@ int main(int argc, char** argv) {
       if (k + PF < w) __builtin_prefetch(&id_map.t[tab[k + PF]->ph & id_map.mask]);
       const ERaw* r = tab[k];
       Person pp = resolve(r->ph, r->name, r->name_n);
-      out[pp.h % S].push_back(Ev{pp.h, pp.p, r->ts, pp.n, r->price, r->cat, r->type});
+      out[pp.h % S].push(Ev{pp.h, pp.p, r->ts, pp.n, r->price, r->cat, r->type});
     }
-    for (int t = 0; t < NT; t++) { vector<ERaw>().swap(er_buf[t][s]); }
   });
-  er_buf.clear();
+  g_arena[0].release();
+  vector<vector<const ERaw*>>().swap(tab_scratch);
 
   lap("dedup");
   // ---- per person shard: sort, sessionize, attribute, aggregate
@@ -771,13 +867,14 @@ int main(int argc, char** argv) {
   for (auto& a : cagg) { size_t z = (size_t)(NC + 1) * ndays; a.sess.assign(z, 0); a.purch.assign(z, 0); a.rev.assign(z, 0); a.assist.assign(z, 0); }
   struct URow { const char* name; u32 n; int32_t day; i64 sessions, events, rev; int32_t top; };
   vector<vector<URow>> urows(NT);
+  vector<vector<Ev>> ev_scratch(NT);
+  vector<vector<Ck>> ck_scratch(NT);
 
   parallel_for(S, [&](size_t s, int tid) {
-    vector<Ev> ev; vector<Ck> ck;
-    { size_t n = 0; for (int t = 0; t < NT; t++) n += ev_buf[t][s].size(); ev.reserve(n); }
-    for (int t = 0; t < NT; t++) { ev.insert(ev.end(), ev_buf[t][s].begin(), ev_buf[t][s].end()); vector<Ev>().swap(ev_buf[t][s]); }
-    { size_t n = 0; for (int t = 0; t < NT; t++) n += ck_buf[t][s].size(); ck.reserve(n); }
-    for (int t = 0; t < NT; t++) { ck.insert(ck.end(), ck_buf[t][s].begin(), ck_buf[t][s].end()); vector<Ck>().swap(ck_buf[t][s]); }
+    vector<Ev>& ev = ev_scratch[tid]; vector<Ck>& ck = ck_scratch[tid];
+    ev.clear(); ck.clear();
+    for (int t = 0; t < NT; t++) ev_buf[t][s].append_to(ev);
+    for (int t = 0; t < NT; t++) ck_buf[t][s].append_to(ck);
     if (ev.empty()) return;
     // Person identity inside a shard = (64-bit hash of the name, name length). Comparing names byte by
     // byte here would touch a random input line per event; a false match needs a 64-bit hash collision
@@ -924,6 +1021,7 @@ int main(int argc, char** argv) {
   });
   cw.join();
   lap("write");
+  sample_stop();
   fflush(stdout);
   _exit(0);  // skip destructors / munmap
 }
