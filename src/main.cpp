@@ -476,7 +476,9 @@ struct KeyIndex {
       while (j < k.n && !dig(k.p[j])) j++;
       prefix.assign(k.p, j);
     }
-    map.init(kv.size() + 1);
+    size_t noncanon = 0;
+    for (auto& [k, v] : kv) { i64 c = canon(k.p, k.n); if (!(c >= 0 && c < (1 << 24))) noncanon++; }
+    map.init(noncanon + 1);  // only keys that do not fit the flat array
     for (auto& [k, v] : kv) {
       i64 c = canon(k.p, k.n);
       if (c >= 0 && c < (1 << 24)) {
@@ -740,17 +742,26 @@ int main(int argc, char** argv) {
       SV f[2];
       if (split_fields(s, e, f, 2) && f[0].n) rows.push_back({f[0], f[1]});
     });
+    // distinct categories via a small map (few categories, many products), then byte order
+    std::unordered_map<string_view, u32> first_id;
     vector<string_view> cats;
-    for (auto& r : rows) cats.emplace_back(r.second.p, r.second.n);
-    cats.push_back("unknown");
-    std::sort(cats.begin(), cats.end());
-    cats.erase(std::unique(cats.begin(), cats.end()), cats.end());
-    for (auto& x : cats) cat_names.emplace_back(x);
-    auto cat_idx = [&](string_view n) { return (u32)(std::lower_bound(cats.begin(), cats.end(), n) - cats.begin()); };
-    unknown_cat = (uint16_t)cat_idx("unknown");
+    vector<u32> row_cat(rows.size());
+    for (size_t i = 0; i < rows.size(); i++) {
+      string_view nm(rows[i].second.p, rows[i].second.n);
+      auto it = first_id.find(nm);
+      if (it == first_id.end()) { it = first_id.emplace(nm, (u32)cats.size()).first; cats.push_back(nm); }
+      row_cat[i] = it->second;
+    }
+    if (!first_id.count("unknown")) { first_id.emplace("unknown", (u32)cats.size()); cats.push_back("unknown"); }
+    vector<u32> order(cats.size());
+    for (u32 i = 0; i < order.size(); i++) order[i] = i;
+    std::sort(order.begin(), order.end(), [&](u32 a, u32 b) { return cats[a] < cats[b]; });
+    vector<u32> rank(cats.size());
+    for (u32 r = 0; r < order.size(); r++) { rank[order[r]] = r; cat_names.emplace_back(cats[order[r]]); }
+    unknown_cat = (uint16_t)rank[first_id["unknown"]];
     vector<std::pair<SV, u32>> kv;
     kv.reserve(rows.size());
-    for (auto& r : rows) kv.push_back({r.first, cat_idx(string_view(r.second.p, r.second.n))});
+    for (size_t i = 0; i < rows.size(); i++) kv.push_back({rows[i].first, rank[row_cat[i]]});
     prod_idx.build(kv);
   }
   // campaigns
