@@ -10,5 +10,7 @@ RUN g++ -std=c++20 -O3 -march=x86-64-v3 -mtune=cascadelake -pthread -static \
 FROM scratch
 COPY --from=build /pipeline /pipeline
 # Runs as uid 1000 with a read-only root: reads $DATA_DIR, writes $OUTPUT_DIR, uses $NCPU threads.
+# malloc-backed buffers on 2 MB pages too (ignored where unsupported)
+ENV GLIBC_TUNABLES=glibc.malloc.hugetlb=1
 USER 1000:1000
 CMD ["/pipeline"]
