@@ -816,6 +816,19 @@ int main(int argc, char** argv) {
   vector<MFile> link_files = map_all(data + "/links");
   vector<MFile> click_files = map_all(data + "/clicks");
   vector<MFile> event_files = map_all(data + "/events");
+  if (!getenv("SS_NORA")) {
+    // If the inputs are not in the page cache, queue reads for all of them now, in processing order, so the
+    // disk sees a deep queue of large requests while the workers parse. Cheap when the data is cached.
+    std::thread([data] {
+      for (const char* sub : {"/links", "/clicks", "/events"})
+        for (auto& path : list_csv(data + sub)) {
+          int fd = open(path.c_str(), O_RDONLY);
+          if (fd < 0) continue;
+          posix_fadvise(fd, 0, 0, POSIX_FADV_WILLNEED);
+          close(fd);
+        }
+    }).detach();
+  }
   {
     size_t in_bytes = 0;
     for (auto* v : {&link_files, &click_files, &event_files}) for (auto& f : *v) in_bytes += f.n;
