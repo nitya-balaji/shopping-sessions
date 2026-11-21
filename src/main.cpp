@@ -408,7 +408,7 @@ struct StrMap {  // key bytes -> u32 value; first 16 key bytes stored inline to 
 // go to a flat array; every other key goes to a hash map. A canonical key missing from the array is absent.
 struct KeyIndex {
   string prefix; vector<u32> arr; StrMap map;
-  static const u32 NONE = UINT32_MAX;
+  static constexpr u32 NONE = UINT32_MAX;
   // returns number, or -1 if not canonical
   inline i64 canon(const char* p, u32 n) const {
     u32 pl = (u32)prefix.size();
