@@ -1230,17 +1230,26 @@ int main(int argc, char** argv) {
     if (rs.empty() && t != 0) return;
     vector<Col> cols = {{"user_id", C_STR, {}, {}}, {"day", C_DATE, {}, {}}, {"sessions", C_I64, {}, {}},
                         {"events", C_I64, {}, {}}, {"revenue_cents", C_I64, {}, {}}, {"top_category", C_OPTSTR, {}, {}}};
-    {
-      size_t nb = 0;
-      for (auto& r : rs) nb += 4 + r.n;
-      cols[0].data.b.reserve(nb); cols[1].data.b.reserve(rs.size() * 4);
-      for (int k = 2; k < 5; k++) cols[k].data.b.reserve(rs.size() * 8);
-      cols[5].data.b.reserve(rs.size() * 16); cols[5].def.reserve(rs.size());
-    }
-    for (auto& r : rs) {
-      cols[0].add_str(r.name, r.n); cols[1].add_date(r.day); cols[2].add_i64(r.sessions);
-      cols[3].add_i64(r.events); cols[4].add_i64(r.rev);
-      if (r.top >= 0) cols[5].add_str(cat_names[r.top].data(), (u32)cat_names[r.top].size()); else cols[5].add_null();
+    // exact sizes first, then fill through raw pointers (no per-value vector appends)
+    const size_t nr = rs.size();
+    size_t nb = 0, cb = 0;
+    for (auto& r : rs) { nb += 4 + r.n; if (r.top >= 0) cb += 4 + cat_names[r.top].size(); }
+    cols[0].data.b.resize(nb); cols[1].data.b.resize(nr * 4);
+    for (int k = 2; k < 5; k++) cols[k].data.b.resize(nr * 8);
+    cols[5].data.b.resize(cb); cols[5].def.resize(nr);
+    uint8_t* pn = cols[0].data.b.data(); uint8_t* pd = cols[1].data.b.data();
+    uint8_t* ps = cols[2].data.b.data(); uint8_t* pe = cols[3].data.b.data(); uint8_t* pr = cols[4].data.b.data();
+    uint8_t* pc = cols[5].data.b.data(); uint8_t* pdef = cols[5].def.data();
+    for (size_t i = 0; i < nr; i++) {
+      if (i + 8 < nr) __builtin_prefetch(rs[i + 8].name);
+      const URow& r = rs[i];
+      memcpy(pn, &r.n, 4); memcpy(pn + 4, r.name, r.n); pn += 4 + r.n;
+      memcpy(pd + 4 * i, &r.day, 4);
+      memcpy(ps + 8 * i, &r.sessions, 8); memcpy(pe + 8 * i, &r.events, 8); memcpy(pr + 8 * i, &r.rev, 8);
+      if (r.top >= 0) {
+        const string& c = cat_names[r.top]; u32 cl = (u32)c.size();
+        memcpy(pc, &cl, 4); memcpy(pc + 4, c.data(), cl); pc += 4 + cl; pdef[i] = 1;
+      } else pdef[i] = 0;
     }
     write_parquet(ud + "/part-" + std::to_string(t) + ".parquet", cols, (i64)rs.size());
   });
