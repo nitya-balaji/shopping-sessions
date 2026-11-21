@@ -966,7 +966,8 @@ int main(int argc, char** argv) {
   vector<vector<BList<Ev>>> ev_buf(NT, vector<BList<Ev>>(S));
   vector<vector<BList<Ck>>> ck_buf(NT, vector<BList<Ck>>(S));
   vector<vector<u32>> tab_scratch(NT);
-  vector<vector<ERaw>> loc_scratch(NT);
+  vector<vector<void*>> blk_scratch(NT);
+  vector<vector<u32>> occ_scratch(NT);
   const int PF = 12;  // prefetch distance for person lookups
   vector<vector<void*>> free_lists(NT);
   parallel_for(S + NT, [&](size_t s, int tid) {
@@ -989,45 +990,52 @@ int main(int argc, char** argv) {
     size_t n = 0;
     for (int t = 0; t < NT; t++) n += er_buf[t][s].total;
     if (!n) return;
-    // copy the shard's copies into one contiguous, cache-resident array, then work with u32 indices
-    auto& loc = loc_scratch[tid];
-    loc.resize(n);
-    {
-      size_t q = 0;
-      for (int t = 0; t < NT; t++)
-        for (auto* b = er_buf[t][s].head; b; b = b->next) { memcpy(&loc[q], b->items(), b->n * sizeof(ERaw)); q += b->n; }
-      for (int t = 0; t < NT; t++) er_buf[t][s].recycle();  // blocks go back to this thread for the Ev pushes
-    }
+    // index the shard's copies in place: idx = block number * CAP + item (no copy of the records)
+    using EL = BList<ERaw>;
+    auto& blks = blk_scratch[tid];
+    blks.clear();
+    for (int t = 0; t < NT; t++)
+      for (auto* b = er_buf[t][s].head; b; b = b->next) blks.push_back(b);
+    auto at = [&](u32 idx) -> const ERaw& { return ((const EL::Blk*)blks[idx / EL::CAP])->items()[idx % EL::CAP]; };
     size_t cap = 16; while (cap < n * 2) cap <<= 1;
     auto& tab = tab_scratch[tid];
     tab.assign(cap, UINT32_MAX);
+    auto& occ = occ_scratch[tid];
+    occ.clear();
     const u64 mask = cap - 1;
-    for (u32 i = 0; i < (u32)n; i++) {
-      const ERaw& r = loc[i];
-      for (u64 j = (r.h_eid >> 20) & mask;; j = (j + 1) & mask) {
-        u32& slot = tab[j];
-        if (slot == UINT32_MAX) { slot = i; break; }
-        const ERaw& o = loc[slot];
-        if (o.h_eid == r.h_eid && o.chk == r.chk) {
-          if (r.ingest < o.ingest) slot = i;
-          break;
+    for (u32 bi = 0; bi < (u32)blks.size(); bi++) {
+      const EL::Blk* b = (const EL::Blk*)blks[bi];
+      const ERaw* it = b->items();
+      for (u32 k = 0; k < b->n; k++) {
+        const ERaw& r = it[k];
+        const u32 i = bi * EL::CAP + k;
+        for (u64 j = (r.h_eid >> 20) & mask;; j = (j + 1) & mask) {
+          u32& slot = tab[j];
+          if (slot == UINT32_MAX) { slot = i; occ.push_back((u32)j); break; }
+          const ERaw& o = at(slot);
+          if (o.h_eid == r.h_eid && o.chk == r.chk) {
+            if (r.ingest < o.ingest) slot = i;
+            break;
+          }
         }
       }
     }
     size_t w = 0;
-    for (u32 x : tab) if (x != UINT32_MAX && (loc[x].pk >> 26)) tab[w++] = x;
+    for (u32 j : occ) { u32 x = tab[j]; if (at(x).pk >> 26) occ[w++] = x; }  // winners that are valid
     auto& out = ev_buf[tid];
     for (size_t k = 0; k < w; k++) {
-      if (k + PF < w) __builtin_prefetch(&ptab[loc[tab[k + PF]].uh & pmask]);
-      const ERaw* r = &loc[tab[k]];
+      if (k + PF < w) __builtin_prefetch(&ptab[at(occ[k + PF]).uh & pmask]);
+      const ERaw* r = &at(occ[k]);
       Person pp = resolve(r->uh, ref_p(r->uref), ref_n(r->uref));
       out[pp.h % S].push(Ev{pp.h, pack_ref(pp.p, pp.n), r->ts, r->pk & 0xFFFFFF, r->cat, (uint8_t)((r->pk >> 24) & 3), 0});
     }
+    for (int t = 0; t < NT; t++) er_buf[t][s].recycle();  // blocks go back to this thread for later Ev pushes
   });
   for (auto& f : free_lists) vector<void*>().swap(f);
   parallel_for(NT, [&](size_t t, int) { for (auto& l : ev_buf[t]) l.finish(); for (auto& l : ck_buf[t]) l.finish(); });
   vector<vector<u32>>().swap(tab_scratch);
-  vector<vector<ERaw>>().swap(loc_scratch);
+  vector<vector<void*>>().swap(blk_scratch);
+  vector<vector<u32>>().swap(occ_scratch);
 
   lap("dedup");
   // ---- per person shard: sort, sessionize, attribute, aggregate
