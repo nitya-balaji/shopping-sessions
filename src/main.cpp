@@ -250,6 +250,25 @@ static inline bool split_fields(const char* s, const char* e, SV* out, int k) {
 // SIMD line scanner: for every data line starting in chunk c that splits into exactly K fields
 // under the rules' dialect, calls fn(fields). Malformed lines are skipped. Equivalent to
 // for_lines + split_fields, but finds ',', '"' and '\n' 64 bytes at a time.
+// Per-line SIMD scanner (fast path for lines < 128 bytes not near EOF): one pass of 4 AVX2 loads gives
+// newline, comma and quote bitmasks; fields come from comma positions, and a line is well formed iff it
+// has K-1 commas and every quote is the first or last byte of a field wrapped in a pair of quotes.
+template <int K> static inline bool fields_from_masks(const char* p, u32 len, u64 c0, u64 c1, u64 q0, u64 q1, SV* f) {
+  if (__builtin_popcountll(c0) + __builtin_popcountll(c1) != K - 1) return false;
+  u32 a = 0; int fi = 0; u32 bq = 0;
+  auto field = [&](u32 b) {
+    const char* s = p + a; u32 n = b - a;
+    if (n && s[0] == '"') {
+      if (n < 2 || s[n - 1] != '"') return false;
+      f[fi++] = {s + 1, n - 2}; bq += 2;
+    } else f[fi++] = {s, n};
+    return true;
+  };
+  while (c0) { u32 b = (u32)__builtin_ctzll(c0); c0 &= c0 - 1; if (!field(b)) return false; a = b + 1; }
+  while (c1) { u32 b = 64 + (u32)__builtin_ctzll(c1); c1 &= c1 - 1; if (!field(b)) return false; a = b + 1; }
+  if (!field(len)) return false;
+  return (u32)(__builtin_popcountll(q0) + __builtin_popcountll(q1)) == bq;
+}
 template <int K, class F> static inline void scan_lines(const Chunk& c, F fn) {
   const char* base = c.base;
   const size_t n = c.fsize;
@@ -259,69 +278,39 @@ template <int K, class F> static inline void scan_lines(const Chunk& c, F fn) {
     if (!nl) return;
     pos = nl - base + 1;
   }
-  if (pos >= c.e) return;
   const __m256i vc = _mm256_set1_epi8(','), vq = _mm256_set1_epi8('"'), vn = _mm256_set1_epi8('\n');
-  alignas(32) char tail[64];
   SV f[K];
-  int fi = 0;            // index of the current field
-  size_t fs = pos;       // current field start
-  size_t line = pos;     // current line start
-  int st = 0;            // 0 = in field (unquoted or at start), 1 = inside quotes, 2 = just after closing quote, 3 = malformed
-  size_t qclose = 0;
-  for (size_t blk = pos;; blk += 64) {
-    const char* p = base + blk;
-    u64 mn, mq, mc;
-    if (blk + 64 <= n) {
-      __m256i a = _mm256_loadu_si256((const __m256i*)p), b = _mm256_loadu_si256((const __m256i*)(p + 32));
-      mn = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vn)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, vn)) << 32);
-      mq = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vq)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, vq)) << 32);
-      mc = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vc)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, vc)) << 32);
-    } else {
-      if (blk > n) return;
-      size_t r = n - blk;
-      memset(tail, 0, 64);
-      memcpy(tail, p, r);
-      tail[r] = '\n';  // virtual line end at EOF (r < 64 here)
-      __m256i a = _mm256_load_si256((const __m256i*)tail), b = _mm256_load_si256((const __m256i*)(tail + 32));
-      mn = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vn)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, vn)) << 32);
-      mq = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vq)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, vq)) << 32);
-      mc = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(a, vc)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(b, vc)) << 32);
-      u64 keep = (r + 1 >= 64) ? ~0ULL : ((1ULL << (r + 1)) - 1);
-      mn &= keep; mq &= keep; mc &= keep;
-    }
-    u64 ev = mn | mq | mc;
-    while (ev) {
-      int bit = __builtin_ctzll(ev);
-      ev &= ev - 1;
-      size_t at = blk + bit;
-      u64 m = 1ULL << bit;
-      if (mn & m) {
-        // line end at `at`
-        if (st == 0) {
-          if (fi == K - 1) { f[fi] = {base + fs, u32(at - fs)}; fn(f); }
-        } else if (st == 2) {
-          if (fi == K - 1 && at == qclose + 1) { f[fi] = {base + fs + 1, u32(qclose - fs - 1)}; fn(f); }
-        }
-        line = at + 1;
-        if (line >= c.e) return;
-        fi = 0; fs = line; st = 0;
-      } else if (st == 3) {
+  while (pos < c.e) {
+    const char* p = base + pos;
+    if (pos + 128 <= n) {
+      __m256i x0 = _mm256_loadu_si256((const __m256i*)p), x1 = _mm256_loadu_si256((const __m256i*)(p + 32));
+      u64 n0 = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x0, vn)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x1, vn)) << 32);
+      u64 c0 = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x0, vc)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x1, vc)) << 32);
+      u64 q0 = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x0, vq)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x1, vq)) << 32);
+      if (n0) {
+        u32 len = (u32)__builtin_ctzll(n0);
+        u64 m = len ? (~0ULL >> (64 - len)) : 0;
+        if (fields_from_masks<K>(p, len, c0 & m, 0, q0 & m, 0, f)) fn(f);
+        pos += len + 1;
         continue;
-      } else if (mq & m) {
-        if (st == 0) { st = (at == fs) ? 1 : 3; }
-        else if (st == 1) { st = 2; qclose = at; }
-        else st = 3;  // quote right after a closing quote, or later in the field
-      } else {  // comma
-        if (st == 1) { st = 3; continue; }
-        if (fi >= K - 1) { st = 3; continue; }
-        if (st == 0) f[fi] = {base + fs, u32(at - fs)};
-        else {  // st == 2
-          if (at != qclose + 1) { st = 3; continue; }
-          f[fi] = {base + fs + 1, u32(qclose - fs - 1)};
-        }
-        fi++; fs = at + 1; st = 0;
+      }
+      __m256i x2 = _mm256_loadu_si256((const __m256i*)(p + 64)), x3 = _mm256_loadu_si256((const __m256i*)(p + 96));
+      u64 n1 = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x2, vn)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x3, vn)) << 32);
+      if (n1) {
+        u64 c1 = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x2, vc)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x3, vc)) << 32);
+        u64 q1 = (u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x2, vq)) | ((u64)(u32)_mm256_movemask_epi8(_mm256_cmpeq_epi8(x3, vq)) << 32);
+        u32 len = 64 + (u32)__builtin_ctzll(n1);
+        u64 m = (len - 64) ? (~0ULL >> (128 - len)) : 0;
+        if (fields_from_masks<K>(p, len, c0, c1 & m, q0, q1 & m, f)) fn(f);
+        pos += len + 1;
+        continue;
       }
     }
+    // slow path: long line or close to the end of the file
+    const char* nl = (const char*)memchr(p, '\n', n - pos);
+    const char* e = nl ? nl : base + n;
+    if (split_fields(p, e, f, K)) fn(f);
+    pos = (e - base) + 1;
   }
 }
 
@@ -901,7 +890,8 @@ int main(int argc, char** argv) {
   // ---- dedup events per eid shard, resolve persons (events and clicks) -> person shards
   vector<vector<BList<Ev>>> ev_buf(NT, vector<BList<Ev>>(S));
   vector<vector<BList<Ck>>> ck_buf(NT, vector<BList<Ck>>(S));
-  vector<vector<const ERaw*>> tab_scratch(NT);
+  vector<vector<u32>> tab_scratch(NT);
+  vector<vector<ERaw>> loc_scratch(NT);
   const int PF = 12;  // prefetch distance for person lookups
   vector<vector<void*>> free_lists(NT);
   parallel_for(S + NT, [&](size_t s, int tid) {
@@ -924,37 +914,45 @@ int main(int argc, char** argv) {
     size_t n = 0;
     for (int t = 0; t < NT; t++) n += er_buf[t][s].total;
     if (!n) return;
+    // copy the shard's copies into one contiguous, cache-resident array, then work with u32 indices
+    auto& loc = loc_scratch[tid];
+    loc.resize(n);
+    {
+      size_t q = 0;
+      for (int t = 0; t < NT; t++)
+        for (auto* b = er_buf[t][s].head; b; b = b->next) { memcpy(&loc[q], b->items(), b->n * sizeof(ERaw)); q += b->n; }
+      for (int t = 0; t < NT; t++) er_buf[t][s].recycle();  // blocks go back to this thread for the Ev pushes
+    }
     size_t cap = 16; while (cap < n * 2) cap <<= 1;
     auto& tab = tab_scratch[tid];
-    tab.assign(cap, nullptr);
-    u64 mask = cap - 1;
-    for (int t = 0; t < NT; t++)
-      er_buf[t][s].each([&](const ERaw& r) {
-        for (u64 i = (r.h_eid >> 20) & mask;; i = (i + 1) & mask) {
-          const ERaw*& slot = tab[i];
-          if (!slot) { slot = &r; break; }
-          if (slot->h_eid == r.h_eid && slot->chk == r.chk) {
-            if (r.ingest < slot->ingest) slot = &r;
-            break;
-          }
+    tab.assign(cap, UINT32_MAX);
+    const u64 mask = cap - 1;
+    for (u32 i = 0; i < (u32)n; i++) {
+      const ERaw& r = loc[i];
+      for (u64 j = (r.h_eid >> 20) & mask;; j = (j + 1) & mask) {
+        u32& slot = tab[j];
+        if (slot == UINT32_MAX) { slot = i; break; }
+        const ERaw& o = loc[slot];
+        if (o.h_eid == r.h_eid && o.chk == r.chk) {
+          if (r.ingest < o.ingest) slot = i;
+          break;
         }
-      });
+      }
+    }
     size_t w = 0;
-    for (const ERaw* r : tab) if (r && (r->pk >> 26)) tab[w++] = r;
-    if (DEXP == 1) { dsink += w; return; }
-    if (DEXP == 2) { for (size_t k = 0; k < w; k++) { if (k + PF < w) __builtin_prefetch(&ptab[tab[k + PF]->uh & pmask]); dsink += resolve(tab[k]->uh, ref_p(tab[k]->uref), ref_n(tab[k]->uref)).h; } return; }
+    for (u32 x : tab) if (x != UINT32_MAX && (loc[x].pk >> 26)) tab[w++] = x;
     auto& out = ev_buf[tid];
     for (size_t k = 0; k < w; k++) {
-      if (k + PF < w) __builtin_prefetch(&ptab[tab[k + PF]->uh & pmask]);
-      const ERaw* r = tab[k];
+      if (k + PF < w) __builtin_prefetch(&ptab[loc[tab[k + PF]].uh & pmask]);
+      const ERaw* r = &loc[tab[k]];
       Person pp = resolve(r->uh, ref_p(r->uref), ref_n(r->uref));
       out[pp.h % S].push(Ev{pp.h, pack_ref(pp.p, pp.n), r->ts, r->pk & 0xFFFFFF, r->cat, (uint8_t)((r->pk >> 24) & 3), 0});
     }
-    for (int t = 0; t < NT; t++) er_buf[t][s].recycle();
   });
   for (auto& f : free_lists) vector<void*>().swap(f);
   parallel_for(NT, [&](size_t t, int) { for (auto& l : ev_buf[t]) l.finish(); for (auto& l : ck_buf[t]) l.finish(); });
-  vector<vector<const ERaw*>>().swap(tab_scratch);
+  vector<vector<u32>>().swap(tab_scratch);
+  vector<vector<ERaw>>().swap(loc_scratch);
 
   lap("dedup");
   // ---- per person shard: sort, sessionize, attribute, aggregate
