@@ -518,13 +518,17 @@ struct Col {
 };
 
 static void write_parquet(const string& path, vector<Col>& cols, i64 rows) {
-  Buf f;
-  f.put("PAR1", 4);
+  // Streams the file piece by piece: column buffers are written as they are, never copied again.
+  FILE* fp = fopen(path.c_str(), "wb");
+  if (!fp) die(path.c_str());
+  i64 fpos = 0;
+  auto out = [&](const void* p, size_t n) { if (n && fwrite(p, 1, n, fp) != n) die("write"); fpos += (i64)n; };
+  out("PAR1", 4);
   struct Meta { i64 off, size; };
   vector<Meta> metas;
   if (rows > 0) {
     for (auto& c : cols) {
-      Buf page;
+      Buf lev;  // definition levels (optional column): 4-byte length + RLE runs
       if (c.kind == C_OPTSTR) {
         Buf rle;
         size_t i = 0;
@@ -535,22 +539,23 @@ static void write_parquet(const string& path, vector<Col>& cols, i64 rows) {
           rle.put(c.def[i]);
           i = j;
         }
-        page.le32((u32)rle.b.size());
-        page.put(rle.b.data(), rle.b.size());
+        lev.le32((u32)rle.b.size());
+        lev.put(rle.b.data(), rle.b.size());
       }
-      page.put(c.data.b.data(), c.data.b.size());
+      const size_t psize = lev.b.size() + c.data.b.size();
       Buf hdr; Thrift t(hdr);
       t.i32(1, 0);
-      t.i32(2, (int32_t)page.b.size());
-      t.i32(3, (int32_t)page.b.size());
+      t.i32(2, (int32_t)psize);
+      t.i32(3, (int32_t)psize);
       t.begin(5);
       t.i32(1, (int32_t)rows); t.i32(2, 0); t.i32(3, 3); t.i32(4, 3);
       t.end();
       hdr.put(0);
-      i64 off = f.b.size();
-      f.put(hdr.b.data(), hdr.b.size());
-      f.put(page.b.data(), page.b.size());
-      metas.push_back({off, (i64)(hdr.b.size() + page.b.size())});
+      i64 off = fpos;
+      out(hdr.b.data(), hdr.b.size());
+      out(lev.b.data(), lev.b.size());
+      out(c.data.b.data(), c.data.b.size());
+      metas.push_back({off, (i64)(hdr.b.size() + psize)});
     }
   }
   Buf meta; Thrift t(meta);
@@ -600,13 +605,11 @@ static void write_parquet(const string& path, vector<Col>& cols, i64 rows) {
   }
   t.str(6, "shopping-sessions-cpp");
   meta.put(0);
-  f.put(meta.b.data(), meta.b.size());
-  f.le32((u32)meta.b.size());
-  f.put("PAR1", 4);
-  FILE* fp = fopen(path.c_str(), "wb");
-  if (!fp) die(path.c_str());
-  if (fwrite(f.b.data(), 1, f.b.size(), fp) != f.b.size()) die("write");
-  fclose(fp);
+  out(meta.b.data(), meta.b.size());
+  u32 ml = (u32)meta.b.size();
+  out(&ml, 4);
+  out("PAR1", 4);
+  if (fclose(fp) != 0) die("close");
 }
 
 
@@ -839,7 +842,12 @@ int main(int argc, char** argv) {
           if (f[0].n == 0) return;
           ERaw r;
           r.h_eid = hash_bytes(f[0].p, f[0].n);
-          r.chk = (uint16_t)hash_bytes2(f[0].p, f[0].n);
+          {  // independent 16-bit check: raw first/last two bytes and length (h_eid is a strong 64-bit hash)
+            const SV& e = f[0];
+            u32 a2 = (uint8_t)e.p[0] | ((u32)(uint8_t)e.p[e.n > 1 ? 1 : 0] << 8);
+            u32 z2 = (uint8_t)e.p[e.n - 1] | ((u32)(uint8_t)e.p[e.n > 1 ? e.n - 2 : 0] << 8);
+            r.chk = (uint16_t)((a2 * 31 + z2) ^ (e.n * 0x9E37u));
+          }
           i64 ingest = parse_ts(f[3].p, f[3].n);
           r.uh = 0; r.uref = 0; r.ts = 0; r.pk = 0; r.cat = 0;
           if (ingest == BAD_TS) r.ingest = INT32_MAX;
@@ -1147,6 +1155,13 @@ int main(int argc, char** argv) {
     if (rs.empty() && t != 0) return;
     vector<Col> cols = {{"user_id", C_STR, {}, {}}, {"day", C_DATE, {}, {}}, {"sessions", C_I64, {}, {}},
                         {"events", C_I64, {}, {}}, {"revenue_cents", C_I64, {}, {}}, {"top_category", C_OPTSTR, {}, {}}};
+    {
+      size_t nb = 0;
+      for (auto& r : rs) nb += 4 + r.n;
+      cols[0].data.b.reserve(nb); cols[1].data.b.reserve(rs.size() * 4);
+      for (int k = 2; k < 5; k++) cols[k].data.b.reserve(rs.size() * 8);
+      cols[5].data.b.reserve(rs.size() * 16); cols[5].def.reserve(rs.size());
+    }
     for (auto& r : rs) {
       cols[0].add_str(r.name, r.n); cols[1].add_date(r.day); cols[2].add_i64(r.sessions);
       cols[3].add_i64(r.events); cols[4].add_i64(r.rev);
