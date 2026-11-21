@@ -537,9 +537,8 @@ static inline u64 pack_ref(const char* p, u32 n) { return (u64)(uintptr_t)p | ((
 static inline const char* ref_p(u64 r) { return (const char*)(uintptr_t)(r & 0xFFFFFFFFFFFFULL); }
 static inline u32 ref_n(u64 r) { return (u32)(r >> 48); }
 // Timestamps inside records are u32 milliseconds since TBASE (= window_start - 7 days).
-struct ERaw {  // an event copy after parse, keyed for dedup (40 bytes)
+struct ERaw {  // an event copy after parse, keyed for dedup (32 bytes)
   u64 h_eid;      // event_id hash; identity = h_eid + chk (see SOLUTION.md)
-  u64 uh;         // user_id hash
   u64 uref;       // user_id pointer + length
   int32_t ingest; // ingest_ts in seconds since window_start (clamped to int32)
   u32 ts;
@@ -549,7 +548,7 @@ struct ERaw {  // an event copy after parse, keyed for dedup (40 bytes)
 };
 struct Ev { u64 ph; u64 nref; u32 ts; u32 price; uint16_t cat; uint8_t type; uint8_t pad; };  // 32 bytes
 struct Ck { u64 ph; const char* cid; u32 ts; u32 camp; uint16_t cid_n; uint16_t name_n; u32 pad; };  // 32 bytes
-static_assert(sizeof(ERaw) == 40 && sizeof(Ev) == 32 && sizeof(Ck) == 32);
+static_assert(sizeof(ERaw) == 32 && sizeof(Ev) == 32 && sizeof(Ck) == 32);
 
 // ---------------------------------------------------------------- Parquet writer
 struct Buf {
@@ -938,7 +937,7 @@ int main(int argc, char** argv) {
             r.chk = (uint16_t)((a2 * 31 + z2) ^ (e.n * 0x9E37u));
           }
           i64 ingest = parse_ts(f[3].p, f[3].n);
-          r.uh = 0; r.uref = 0; r.ts = 0; r.pk = 0; r.cat = 0;
+          r.uref = 0; r.ts = 0; r.pk = 0; r.cat = 0;
           if (ingest == BAD_TS) r.ingest = INT32_MAX;
           else {
             i64 q = floordiv(ingest - ws, 1000);
@@ -973,7 +972,7 @@ int main(int argc, char** argv) {
             u32 pc = prod_idx.find(f[5].p, f[5].n);
             r.cat = pc == KeyIndex::NONE ? unknown_cat : (uint16_t)pc;
             // person is resolved after dedup; keep the raw user id here
-            r.uref = pack_ref(f[1].p, f[1].n); r.uh = hash_bytes(f[1].p, f[1].n);
+            r.uref = pack_ref(f[1].p, f[1].n);
             r.ts = (u32)(ts - TBASE); r.pk = price | ((u32)type << 24) | (1u << 26);
           } while (0);
           out[(r.h_eid >> 7) % S].push(r);
@@ -990,6 +989,7 @@ int main(int argc, char** argv) {
   vector<vector<u32>> tab_scratch(NT);
   vector<vector<void*>> blk_scratch(NT);
   vector<vector<u32>> occ_scratch(NT);
+  vector<vector<u64>> hv_scratch(NT);
   const int PF = 12;  // prefetch distance for person lookups
   vector<vector<void*>> free_lists(NT);
   parallel_for(S + NT, [&](size_t s, int tid) {
@@ -1046,10 +1046,18 @@ int main(int argc, char** argv) {
     size_t w = 0;
     for (u32 j : occ) { u32 x = tab[j]; if (at(x).pk >> 26) occ[w++] = x; }  // winners that are valid
     auto& out = ev_buf[tid];
+    // user-id hashes are computed here, only for winning copies (the id bytes are prefetched ahead)
+    auto& hv = hv_scratch[tid];
+    hv.resize(w);
     for (size_t k = 0; k < w; k++) {
-      if (k + PF < w) __builtin_prefetch(&ptab[at(occ[k + PF]).uh & pmask]);
+      if (k + 16 < w) __builtin_prefetch(ref_p(at(occ[k + 16]).uref));
+      const ERaw& r = at(occ[k]);
+      hv[k] = hash_bytes(ref_p(r.uref), ref_n(r.uref));
+    }
+    for (size_t k = 0; k < w; k++) {
+      if (k + PF < w) __builtin_prefetch(&ptab[hv[k + PF] & pmask]);
       const ERaw* r = &at(occ[k]);
-      Person pp = resolve(r->uh, ref_p(r->uref), ref_n(r->uref));
+      Person pp = resolve(hv[k], ref_p(r->uref), ref_n(r->uref));
       out[pp.h % S].push(Ev{pp.h, pack_ref(pp.p, pp.n), r->ts, r->pk & 0xFFFFFF, r->cat, (uint8_t)((r->pk >> 24) & 3), 0});
     }
     for (int t = 0; t < NT; t++) er_buf[t][s].recycle();  // blocks go back to this thread for later Ev pushes
