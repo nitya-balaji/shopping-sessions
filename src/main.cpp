@@ -255,19 +255,32 @@ static inline bool split_fields(const char* s, const char* e, SV* out, int k) {
 // has K-1 commas and every quote is the first or last byte of a field wrapped in a pair of quotes.
 template <int K> static inline bool fields_from_masks(const char* p, u32 len, u64 c0, u64 c1, u64 q0, u64 q1, SV* f) {
   if (__builtin_popcountll(c0) + __builtin_popcountll(c1) != K - 1) return false;
-  u32 a = 0; int fi = 0; u32 bq = 0;
-  auto field = [&](u32 b) {
-    const char* s = p + a; u32 n = b - a;
-    if (n && s[0] == '"') {
-      if (n < 2 || s[n - 1] != '"') return false;
-      f[fi++] = {s + 1, n - 2}; bq += 2;
-    } else f[fi++] = {s, n};
+  // field boundaries: K-1 comma positions, then len
+  u32 ends[K];
+  int k = 0;
+  while (c0) { ends[k++] = (u32)__builtin_ctzll(c0); c0 &= c0 - 1; }
+  while (c1) { ends[k++] = 64 + (u32)__builtin_ctzll(c1); c1 &= c1 - 1; }
+  ends[K - 1] = len;
+  const u32 nq = (u32)(__builtin_popcountll(q0) + __builtin_popcountll(q1));
+  if (nq == 0) {  // common fast path: no quotes at all
+    u32 a = 0;
+    for (int i = 0; i < K; i++) { f[i] = {p + a, ends[i] - a}; a = ends[i] + 1; }
     return true;
-  };
-  while (c0) { u32 b = (u32)__builtin_ctzll(c0); c0 &= c0 - 1; if (!field(b)) return false; a = b + 1; }
-  while (c1) { u32 b = 64 + (u32)__builtin_ctzll(c1); c1 &= c1 - 1; if (!field(b)) return false; a = b + 1; }
-  if (!field(len)) return false;
-  return (u32)(__builtin_popcountll(q0) + __builtin_popcountll(q1)) == bq;
+  }
+  // branch-free, from the masks: a field is quoted iff its first byte is '"'; then its last byte must
+  // be '"' too and n >= 2. Every quote in the line must be one of these.
+  auto qbit = [&](u32 x) -> u32 { u64 w = x < 64 ? q0 : q1; return (u32)((w >> (x & 63)) & 1); };
+  u32 a = 0, bq = 0, ok = 1;
+  for (int i = 0; i < K; i++) {
+    const u32 e = ends[i], n = e - a;
+    const u32 q = n ? qbit(a) : 0;
+    const u32 last = n ? qbit(e - 1) : 0;
+    ok &= (q ^ 1) | ((n >= 2) & last);
+    f[i] = {p + a + q, n - 2 * q};
+    bq += 2 * q;
+    a = e + 1;
+  }
+  return ok && nq == bq;
 }
 template <int K, class F> static inline void scan_lines(const Chunk& c, F fn) {
   const char* base = c.base;
@@ -325,6 +338,24 @@ static inline i64 days_from_civil(i64 y, unsigned m, unsigned d) {
   return era * 146097 + (i64)doe - 719468;
 }
 static inline int d2(const char* p) { return (p[0] - '0') * 10 + (p[1] - '0'); }
+// Calendar tables for years [DT_Y0, DT_Y0 + DT_NY); other years use days_from_civil.
+static const int DT_Y0 = 1900, DT_NY = 300;
+struct DateTables {
+  int32_t jan1[DT_NY]; uint8_t leap[DT_NY]; int cum[2][12]; int dim[2][12];
+  DateTables() {
+    static const int dm[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    for (int l = 0; l < 2; l++) {
+      int c = 0;
+      for (int m = 0; m < 12; m++) { dim[l][m] = dm[m] + (l && m == 1); cum[l][m] = c; c += dim[l][m]; }
+    }
+    for (int i = 0; i < DT_NY; i++) {
+      int y = DT_Y0 + i;
+      leap[i] = (y % 4 == 0 && y % 100 != 0) || y % 400 == 0;
+      jan1[i] = (int32_t)days_from_civil(y, 1, 1);
+    }
+  }
+};
+static const DateTables g_dt;
 // Parses YYYY-MM-DDTHH:MM:SS at p (19 chars); returns epoch ms or BAD_TS.
 static inline u64 ld8(const char* p) { u64 v; memcpy(&v, p, 8); return v; }
 // true if every byte selected by mask m is an ASCII digit
@@ -340,11 +371,26 @@ static inline i64 parse_dt(const char* p) {
   if ((a & ~MA) != (0x2D00002D00000000ULL) || (b & ~MB) != (0x00003A0000540000ULL) || (c & ~MC) != (0x00003A00003A0000ULL)) return BAD_TS;
   int y = d2(p) * 100 + d2(p + 2), mo = d2(p + 5), d = d2(p + 8), h = d2(p + 11), mi = d2(p + 14), sec = d2(p + 17);
   if (mo < 1 || mo > 12 || d < 1 || h > 23 || mi > 59 || sec > 59) return BAD_TS;
-  static const int dim[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-  int md = dim[mo - 1];
-  if (mo == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) md = 29;
-  if (d > md) return BAD_TS;
-  return (days_from_civil(y, mo, d) * 86400 + h * 3600 + mi * 60 + sec) * 1000;
+  i64 days;
+  if (y >= DT_Y0 && y < DT_Y0 + DT_NY) {  // table path
+    const int leap = g_dt.leap[y - DT_Y0];
+    if (d > g_dt.dim[leap][mo - 1]) return BAD_TS;
+    days = g_dt.jan1[y - DT_Y0] + g_dt.cum[leap][mo - 1] + d - 1;
+  } else {
+    static const int dim[] = {31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
+    int md = dim[mo - 1];
+    if (mo == 2 && ((y % 4 == 0 && y % 100 != 0) || y % 400 == 0)) md = 29;
+    if (d > md) return BAD_TS;
+    days = days_from_civil(y, mo, d);
+  }
+  return (days * 86400 + h * 3600 + mi * 60 + sec) * 1000;
+}
+// 8 ASCII digits (first digit in the lowest byte) -> value
+static inline u32 swar8(u64 v) {
+  v -= 0x3030303030303030ULL;
+  v = (v * 10) + (v >> 8);
+  v = (((v & 0x000000FF000000FFULL) * (100 + (1000000ULL << 32))) + (((v >> 16) & 0x000000FF000000FFULL) * (1 + (10000ULL << 32)))) >> 32;
+  return (u32)v;
 }
 // Any of F1/F2/F3. Returns BAD_TS when malformed or (F3) outside int64.
 static inline i64 parse_ts(const char* p, u32 n) {
@@ -363,6 +409,11 @@ static inline i64 parse_ts(const char* p, u32 n) {
     }
   }
   // F3: digits only
+  if (n == 13) {  // the usual epoch-ms width: SWAR check + convert
+    const u64 a = ld8(p), b = ld8(p + 5);
+    if (!digits8(a, ~0ULL) || !digits8(b, ~0ULL)) return BAD_TS;
+    return (i64)swar8(a) * 100000 + (i64)(swar8(b) % 100000);
+  }
   u32 i = 0;
   for (u32 j = 0; j < n; j++) if (!dig(p[j])) return BAD_TS;
   while (i < n && p[i] == '0') i++;
@@ -840,6 +891,9 @@ int main(int argc, char** argv) {
         auto& out = er_buf[tid];
         scan_lines<7>(ev_chunks[i - nck], [&](const SV* f) {
           if (f[0].n == 0) return;
+          if (DEXP == 11) { dsink += f[6].n; return; }
+          if (DEXP == 12) { dsink += parse_ts(f[2].p, f[2].n) + parse_ts(f[3].p, f[3].n); return; }
+          if (DEXP == 13) { dsink += parse_ts(f[2].p, f[2].n) + parse_ts(f[3].p, f[3].n) + hash_bytes(f[0].p, f[0].n) + hash_bytes(f[1].p, f[1].n) + prod_idx.find(f[5].p, f[5].n); return; }
           ERaw r;
           r.h_eid = hash_bytes(f[0].p, f[0].n);
           {  // independent 16-bit check: raw first/last two bytes and length (h_eid is a strong 64-bit hash)
