@@ -119,18 +119,19 @@ template <class T> struct BList {
   };
   static_assert(sizeof(Blk) <= BLK_BYTES && offsetof(Blk, data) == HDR);
   Blk* head = nullptr; Blk* tail = nullptr; size_t total = 0;
-  char* dst = nullptr; u32 soff = 0;
+  char* dst = nullptr; u32 soff = 0; u32 tn = CAP;  // tn = items in tail (kept here, not in the cold block header)
   alignas(64) char stage[256 + sizeof(T)];
   inline void flush_stage() { if (soff) { memcpy(dst, stage, soff); soff = 0; } }
   inline void push(const T& x) {
-    if (!tail || tail->n == CAP) {
+    if (tn == CAP) {
       flush_stage();
+      if (tail) tail->n = CAP;
       Blk* b = (Blk*)block_alloc(); b->next = nullptr; b->n = 0;
       if (tail) tail->next = b; else head = b;
-      tail = b; dst = b->data;
+      tail = b; dst = b->data; tn = 0;
     }
     memcpy(stage + soff, &x, sizeof(T)); soff += sizeof(T);
-    tail->n++; total++;
+    tn++; total++;
     if (soff >= 256) {
       for (int i = 0; i < 8; i++)
         _mm256_stream_si256((__m256i*)(dst + 32 * i), _mm256_load_si256((const __m256i*)(stage + 32 * i)));
@@ -138,11 +139,11 @@ template <class T> struct BList {
       if (soff) memcpy(stage, stage + 256, soff);
     }
   }
-  inline void finish() { flush_stage(); }
+  inline void finish() { flush_stage(); if (tail) tail->n = tn; }
   template <class F> inline void each(F f) const { for (Blk* b = head; b; b = b->next) { const T* it = b->items(); for (u32 i = 0; i < b->n; i++) f(it[i]); } }
   inline void append_to(vector<T>& v) const { for (Blk* b = head; b; b = b->next) v.insert(v.end(), b->items(), b->items() + b->n); }
   // hand every block to the calling thread's free list (the list must not be used afterwards)
-  inline void recycle() { for (Blk* b = head; b;) { Blk* n = b->next; if (tl_free) tl_free->push_back(b); b = n; } head = tail = nullptr; total = 0; dst = nullptr; soff = 0; }
+  inline void recycle() { for (Blk* b = head; b;) { Blk* n = b->next; if (tl_free) tl_free->push_back(b); b = n; } head = tail = nullptr; total = 0; dst = nullptr; soff = 0; tn = CAP; }
 };
 
 // ---------------------------------------------------------------- parallel helper
@@ -979,8 +980,9 @@ int main(int argc, char** argv) {
     for (int t = 0; t < NT; t++) { ne += ev_buf[t][s].total; nc += ck_buf[t][s].total; }
     if (!ne) return;
     Scratch& sc = scratch[tid];
-    size_t cap = 16; while (cap < 2 * ne) cap <<= 1;
-    const u64 m = cap - 1;
+    // persons per shard are far fewer than events: start small, double at half load
+    size_t cap = 64; while (cap < ne / 8) cap <<= 1;
+    u64 m = cap - 1;
     sc.ptab.assign(cap, PKey{0, 0, UINT32_MAX});
     sc.epid.resize(ne); sc.cnt.clear();
     auto pfind = [&](u64 h, u32 n, bool insert) -> u32 {
@@ -988,7 +990,18 @@ int main(int argc, char** argv) {
         PKey& e = sc.ptab[j];
         if (e.id == UINT32_MAX) {
           if (!insert) return UINT32_MAX;
-          e = PKey{h, n, (u32)sc.cnt.size()}; sc.cnt.push_back(0); return e.id;
+          u32 id = (u32)sc.cnt.size();
+          e = PKey{h, n, id}; sc.cnt.push_back(0);
+          if (2 * sc.cnt.size() > cap) {  // grow and rehash
+            vector<PKey> old; old.swap(sc.ptab);
+            cap <<= 1; m = cap - 1;
+            sc.ptab.assign(cap, PKey{0, 0, UINT32_MAX});
+            for (const PKey& o : old)
+              if (o.id != UINT32_MAX)
+                for (u64 k = (o.h >> 9) & m;; k = (k + 1) & m)
+                  if (sc.ptab[k].id == UINT32_MAX) { sc.ptab[k] = o; break; }
+          }
+          return id;
         }
         if (e.h == h && e.n == n) return e.id;
       }
