@@ -33,9 +33,9 @@ The Dockerfile could not be built here (Docker is not working on this machine): 
 5. **Event dedup.** Each parsed copy (valid or not) is sent to a shard by `event_id` hash; per shard a
    hash table keeps the copy with the smallest `ingest_ts`, and only then is validity checked
    (dedup before validation). Click duplicates are identical, so they cannot change any output.
-6. **Persons.** (records live in append-only 16 KB blocks from per-phase arenas: no vector growth or copies; the raw-copy arena is freed right after dedup)
-    Surviving events and valid clicks resolve their user ID to the person name (prefetched
-   hash lookups) and are re-sharded by person.
+6. **Persons.** Surviving events and valid clicks resolve their user ID to the person name (prefetched
+   hash lookups) and are re-sharded by person. All shuffled records live in append-only 16 KB blocks
+   from per-phase arenas (no vector growth or copies); the raw-copy arena is freed right after dedup.
 7. **Sessions.** Per shard, events sort by (person, ts) and clicks by (person, ts, click_id). One pass per
    person builds sessions (gap > 30 min, equal timestamps share), credits the latest click within 7 days
    (tie: smallest click_id), and keeps a sliding 7-day window of distinct campaigns for assists.
