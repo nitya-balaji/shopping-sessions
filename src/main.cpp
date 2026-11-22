@@ -389,7 +389,12 @@ static inline const char* keep_str(const char* p, u32 n) {
     if (n > 8192) { char* big = (char*)malloc(n); memcpy(big, p, n); return big; }
     tl_scur = (char*)block_alloc(); tl_send = tl_scur + BLK_BYTES;
   }
-  char* d = tl_scur; memcpy(d, p, n); tl_scur += n; return d;
+  char* d = tl_scur;
+  if (n >= 8 && n <= 16 && (size_t)(tl_send - tl_scur) >= 16) {  // ids are ~9 bytes: two overlapping 8-byte moves
+    u64 a, b; __builtin_memcpy(&a, p, 8); __builtin_memcpy(&b, p + n - 8, 8);
+    __builtin_memcpy(d, &a, 8); __builtin_memcpy(d + n - 8, &b, 8);
+  } else memcpy(d, p, n);
+  tl_scur += n; return d;
 }
 
 // ---------------------------------------------------------------- timestamps
