@@ -559,6 +559,24 @@ struct KeyIndex {
     if (c >= 0) return (c < (i64)arr.size() && c < (1 << 24)) ? arr[c] : (c < (1 << 24) ? NONE : find_map(p, n));
     return find_map(p, n);
   }
+  // Same result as find(), for keys inside a read buffer with at least 8 readable bytes after the key's
+  // prefix (true for parse buffers, which carry 64 KB of slack). Digits are validated and converted 8 at a
+  // time; anything unusual takes the exact path.
+  inline u32 find_fast(const char* p, u32 n) const {
+    const u32 pl = (u32)prefix.size();
+    const u32 m = n - pl;  // digit count
+    if (n > pl && m <= 8 && (pl == 0 || p[0] == prefix[0]) && (pl < 2 || p[1] == prefix[1]) && pl <= 2) {
+      const u64 mask = m == 8 ? ~0ULL : ((1ULL << (8 * m)) - 1);
+      const u64 v = ld8u(p + pl) & mask;
+      if (digits8(v, mask) && p[pl] != '0') {
+        // left-pad with '0' digits so the value is right-aligned in 8 digits
+        const u64 v8 = m == 8 ? v : ((v << (8 * (8 - m))) | (0x3030303030303030ULL >> (8 * m)));
+        const u32 c = swar8(v8);
+        if (c < (1u << 24)) return c < arr.size() ? arr[c] : NONE;
+      }
+    }
+    return find(p, n);
+  }
   inline u32 find_map(const char* p, u32 n) const {
     const StrMap::Slot* s = map.find(hash_bytes(p, n), p, n);
     return s ? s->v : NONE;
@@ -987,7 +1005,7 @@ int main(int argc, char** argv) {
           if (f[0].n == 0 || f[1].n == 0) return;
           i64 ts = parse_ts(f[3].p, f[3].n);
           if (ts == BAD_TS || ts < cws || ts >= we) return;
-          u32 camp = camp_idx.find(f[2].p, f[2].n);
+          u32 camp = camp_idx.find_fast(f[2].p, f[2].n);
           if (camp == KeyIndex::NONE) return;
           if (f[0].n > 0xFFFF || f[1].n > 0xFFFF) die("id longer than 65535 bytes");
           out.push(CRaw{hash_bytes(f[1].p, f[1].n), keep_str(f[0].p, f[0].n), (u32)(ts - TBASE), camp, (uint16_t)f[1].n, (uint16_t)f[0].n, 0});
@@ -1040,7 +1058,7 @@ int main(int argc, char** argv) {
             }
             if (ingest - ts > DAY_MS) break;
             if (f[1].n > 0xFFFF) die("id longer than 65535 bytes");
-            u32 pc = prod_idx.find(f[5].p, f[5].n);
+            u32 pc = prod_idx.find_fast(f[5].p, f[5].n);
             r.cat = pc == KeyIndex::NONE ? unknown_cat : (uint16_t)pc;
             // person is resolved after dedup; keep the raw user id here
             r.uref = pack_ref(keep_str(f[1].p, f[1].n), f[1].n); r.uh = hash_bytes(f[1].p, f[1].n);
