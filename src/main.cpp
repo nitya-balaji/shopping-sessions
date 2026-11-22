@@ -964,8 +964,10 @@ int main(int argc, char** argv) {
   struct CRaw { u64 uh; const char* cid; u32 ts; u32 camp; uint16_t uid_n, cid_n; u32 pad; };  // 32 bytes
   vector<BList<CRaw>> cr_buf(NT);
   vector<vector<BList<ERaw>>> er_buf(NT, vector<BList<ERaw>>(S));
-  auto ck_chunks = make_chunks(click_files, 4 << 20);
-  auto ev_chunks = make_chunks(event_files, 4 << 20);
+  size_t CHUNK = getenv("SS_CHUNK") ? (size_t)atol(getenv("SS_CHUNK")) : 0;  // bytes per parse task
+  if (CHUNK < 4096) CHUNK = (size_t)256 << 10;  // small enough that a chunk read with pread stays in L2 while it is parsed
+  auto ck_chunks = make_chunks(click_files, CHUNK);
+  auto ev_chunks = make_chunks(event_files, CHUNK);
   {
     size_t nck = ck_chunks.size();
     parallel_for(1 + nck + ev_chunks.size(), [&](size_t i, int tid) {
