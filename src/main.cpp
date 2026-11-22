@@ -1378,6 +1378,8 @@ int main(int argc, char** argv) {
       i++;
     });
     write_parquet(ud + "/part-" + std::to_string(t) + ".parquet", cols, (i64)nr);
+    // EXPERIMENT: write the same file again under an ignored name ("_" prefix) to measure output-write cost
+    write_parquet(ud + "/_dup-" + std::to_string(t) + ".parquet", cols, (i64)nr);
   });
   cw.join();
   lap("write");
