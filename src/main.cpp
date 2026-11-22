@@ -723,6 +723,9 @@ static void sample_stop() {
 // ---------------------------------------------------------------- main
 static string env(const char* k, const char* d) { const char* v = getenv(k); return v && *v ? v : d; }
 
+// Profile-guided builds link src/pgo_gen.cpp, which points this at libgcov's dump (_exit skips the normal
+// one). Every other build leaves it null, so main() is identical in both, as the profile requires.
+void (*g_before_exit)() = nullptr;
 int main(int argc, char** argv) {
   sample_start();
   string data = env("DATA_DIR", "/data"), outd = env("OUTPUT_DIR", "/output");
@@ -1315,5 +1318,6 @@ int main(int argc, char** argv) {
     });
     lap("released");
   }
+  if (g_before_exit) g_before_exit();
   _exit(0);  // skip destructors / munmap
 }

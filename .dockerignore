@@ -5,7 +5,6 @@ out/
 .git
 _downloads/
 dev-answer/
-generator/
 starters/
 tools/
 target/
