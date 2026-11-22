@@ -170,7 +170,15 @@ template <class F> static void parallel_for(size_t n, F f) {
 }
 
 // ---------------------------------------------------------------- files
-struct MFile { const char* p = nullptr; size_t n = 0; };
+struct MFile { const char* p = nullptr; size_t n = 0; int fd = -1; };  // p = mapping, or fd for pread
+static MFile open_file(const string& path) {  // for pread: no mapping
+  MFile f;
+  f.fd = open(path.c_str(), O_RDONLY);
+  if (f.fd < 0) die(path.c_str());
+  struct stat st; fstat(f.fd, &st);
+  f.n = st.st_size;
+  return f;
+}
 static MFile map_file(const string& path) {
   MFile f;
   int fd = open(path.c_str(), O_RDONLY);
@@ -199,11 +207,11 @@ static vector<string> list_csv(const string& dir) {
 }
 
 // Work chunks: lines belong to the chunk holding their first byte; each file's first line (header) is skipped.
-struct Chunk { const char* base; size_t fsize, b, e; };
+struct Chunk { const char* base; size_t fsize, b, e; int fd = -1; };
 static vector<Chunk> make_chunks(const vector<MFile>& files, size_t target) {
   vector<Chunk> cs;
   for (auto& f : files)
-    for (size_t b = 0; b < f.n; b += target) cs.push_back({f.p, f.n, b, std::min(f.n, b + target)});
+    for (size_t b = 0; b < f.n; b += target) cs.push_back({f.p, f.n, b, std::min(f.n, b + target), f.fd});
   return cs;
 }
 // Calls fn(line_begin, line_end) for every data line starting in the chunk.
@@ -300,7 +308,7 @@ static const int PF_DIST = getenv("SS_PFD") ? atoi(getenv("SS_PFD")) : 1024;  //
 template <int K, class F> static inline void scan_lines(const Chunk& c, F fn) {
   const char* base = c.base;
   const size_t n = c.fsize;
-  if (POPULATE) {  // map this chunk's file pages in one call instead of one fault per few pages
+  if (POPULATE && c.fd < 0) {  // map this chunk's file pages in one call instead of one fault per few pages
     uintptr_t a0 = (uintptr_t)(base + c.b) & ~(uintptr_t)4095;
     uintptr_t a1 = std::min((uintptr_t)(base + n), (uintptr_t)(base + c.e) + 8192);
     if (a1 > a0) madvise((void*)a0, a1 - a0, 22 /* MADV_POPULATE_READ */);
@@ -349,6 +357,39 @@ template <int K, class F> static inline void scan_lines(const Chunk& c, F fn) {
     if (split_fields(p, e, f, K)) fn(f);
     pos = (e - base) + 1;
   }
+}
+
+// Reads chunk c of a pread file into a reused per-thread buffer and returns the equivalent in-buffer chunk
+// (same lines, same header rule). The buffer extends past c.e to the end of the last line starting in c.
+static thread_local vector<char> tl_rbuf;
+static Chunk load_chunk(const Chunk& c) {
+  const size_t start = c.b ? c.b - 1 : 0;
+  size_t extra = 64 << 10;
+  for (;;) {
+    const size_t end = std::min(c.fsize, c.e + extra);
+    const size_t len = end - start;
+    if (tl_rbuf.size() < len) tl_rbuf.resize(len + (64 << 10));
+    size_t done = 0;
+    while (done < len) {
+      ssize_t r = pread(c.fd, tl_rbuf.data() + done, len - done, (off_t)(start + done));
+      if (r <= 0) die("pread");
+      done += (size_t)r;
+    }
+    // the last line starting before c.e must end inside the buffer (or the file must end there)
+    if (end == c.fsize || c.e == c.b || memchr(tl_rbuf.data() + (c.e - 1 - start), '\n', end - (c.e - 1)) != nullptr)
+      return Chunk{tl_rbuf.data(), len, c.b - start, c.e - start, -1};
+    extra *= 4;
+  }
+}
+// Bump allocator for the few input bytes that must outlive the read buffer (user ids, click ids).
+static thread_local char* tl_scur = nullptr;
+static thread_local char* tl_send = nullptr;
+static inline const char* keep_str(const char* p, u32 n) {
+  if ((size_t)(tl_send - tl_scur) < n) {
+    if (n > 8192) { char* big = (char*)malloc(n); memcpy(big, p, n); return big; }
+    tl_scur = (char*)block_alloc(); tl_send = tl_scur + BLK_BYTES;
+  }
+  char* d = tl_scur; memcpy(d, p, n); tl_scur += n; return d;
 }
 
 // ---------------------------------------------------------------- timestamps
@@ -817,8 +858,13 @@ int main(int argc, char** argv) {
     return v;
   };
   vector<MFile> link_files = map_all(data + "/links");
-  vector<MFile> click_files = map_all(data + "/clicks");
-  vector<MFile> event_files = map_all(data + "/events");
+  auto open_all = [&](const string& dir) {
+    vector<MFile> v;
+    for (auto& p : list_csv(dir)) v.push_back(open_file(p));
+    return v;
+  };
+  vector<MFile> click_files = open_all(data + "/clicks");
+  vector<MFile> event_files = open_all(data + "/events");
   if (!getenv("SS_NORA")) {
     // If the inputs are not in the page cache, queue reads for all of them now, in processing order, so the
     // disk sees a deep queue of large requests while the workers parse. Cheap when the data is cached.
@@ -928,18 +974,18 @@ int main(int argc, char** argv) {
       i--;
       if (i < nck) {
         auto& out = cr_buf[tid];
-        scan_lines<4>(ck_chunks[i], [&](const SV* f) {
+        scan_lines<4>(load_chunk(ck_chunks[i]), [&](const SV* f) {
           if (f[0].n == 0 || f[1].n == 0) return;
           i64 ts = parse_ts(f[3].p, f[3].n);
           if (ts == BAD_TS || ts < cws || ts >= we) return;
           u32 camp = camp_idx.find(f[2].p, f[2].n);
           if (camp == KeyIndex::NONE) return;
           if (f[0].n > 0xFFFF || f[1].n > 0xFFFF) die("id longer than 65535 bytes");
-          out.push(CRaw{hash_bytes(f[1].p, f[1].n), f[0].p, (u32)(ts - TBASE), camp, (uint16_t)f[1].n, (uint16_t)f[0].n, 0});
+          out.push(CRaw{hash_bytes(f[1].p, f[1].n), keep_str(f[0].p, f[0].n), (u32)(ts - TBASE), camp, (uint16_t)f[1].n, (uint16_t)f[0].n, 0});
         });
       } else {
         auto& out = er_buf[tid];
-        scan_lines<7>(ev_chunks[i - nck], [&](const SV* f) {
+        scan_lines<7>(load_chunk(ev_chunks[i - nck]), [&](const SV* f) {
           if (f[0].n == 0) return;
           if (DEXP == 11) { dsink += f[6].n; return; }
           if (DEXP == 12) { dsink += parse_ts(f[2].p, f[2].n) + parse_ts(f[3].p, f[3].n); return; }
@@ -988,7 +1034,7 @@ int main(int argc, char** argv) {
             u32 pc = prod_idx.find(f[5].p, f[5].n);
             r.cat = pc == KeyIndex::NONE ? unknown_cat : (uint16_t)pc;
             // person is resolved after dedup; keep the raw user id here
-            r.uref = pack_ref(f[1].p, f[1].n);
+            r.uref = pack_ref(keep_str(f[1].p, f[1].n), f[1].n);
             r.ts = (u32)(ts - TBASE); r.pk = price | ((u32)type << 24) | (1u << 26);
           } while (0);
           out[(r.h_eid >> 7) % S].push(r);
@@ -1311,7 +1357,7 @@ int main(int argc, char** argv) {
     vector<std::pair<char*, size_t>> parts;
     for (size_t o = 0; o < used; o += piece) parts.push_back({g_arena + o, std::min(piece, used - o)});
     for (auto* v : {&event_files, &click_files, &link_files})
-      for (auto& f : *v) if (f.n) parts.push_back({(char*)f.p, f.n});
+      for (auto& f : *v) if (f.n && f.p) parts.push_back({(char*)f.p, f.n});
     parallel_for(parts.size(), [&](size_t i, int) {
       if (parts[i].first >= g_arena && parts[i].first < g_arena + g_arena_cap) madvise(parts[i].first, parts[i].second, MADV_DONTNEED);
       else munmap(parts[i].first, parts[i].second);
