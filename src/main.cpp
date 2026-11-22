@@ -1137,7 +1137,8 @@ int main(int argc, char** argv) {
   vector<CampAgg> cagg(NT);
   for (auto& a : cagg) { size_t z = (size_t)(NC + 1) * ndays; a.sess.assign(z, 0); a.purch.assign(z, 0); a.rev.assign(z, 0); a.assist.assign(z, 0); }
   struct URow { const char* name; u32 n; int32_t day; i64 sessions, events, rev; int32_t top; };
-  vector<vector<URow>> urows(NT);
+  vector<BList<URow>> urows(NT);  // in recycled event/click blocks: no fresh memory
+  vector<vector<void*>> free2(NT);
   struct PKey { u64 h; u32 n; u32 id; };
   struct Scratch {
     vector<PKey> ptab; vector<u32> epid, cpid, cnt, ccnt, eoff, coff, fill;
@@ -1147,6 +1148,8 @@ int main(int argc, char** argv) {
   vector<Scratch> scratch(NT);
 
   parallel_for(S, [&](size_t s, int tid) {
+    tl_free = &free2[tid];
+    struct Fence { ~Fence() { _mm_sfence(); } } fence;
     // Group this shard's records by person with a small hash table + counting sort, then sort each
     // person's few events by ts. Person identity = (64-bit name hash, name length): comparing bytes
     // would touch a random input line per event (see SOLUTION.md for the collision bound).
@@ -1200,6 +1203,7 @@ int main(int argc, char** argv) {
     sc.ck.resize(sc.coff[P]);
     q = 0;
     for (int t = 0; t < NT; t++) ck_buf[t][s].each([&](const Ck& x) { u32 p = sc.cpid[q++]; if (p != UINT32_MAX) sc.ck[sc.fill[p]++] = x; });
+    for (int t = 0; t < NT; t++) { ev_buf[t][s].recycle(); ck_buf[t][s].recycle(); }  // copied out: reuse for output rows
     vector<Ev>& ev = sc.ev; vector<Ck>& ck = sc.ck;
     auto ev_less = [](const Ev& a, const Ev& b) { return a.ts < b.ts; };
     auto ck_less = [](const Ck& a, const Ck& b) { return a.ts != b.ts ? a.ts < b.ts : bytecmp(a.cid, a.cid_n, b.cid, b.cid_n) < 0; };
@@ -1232,7 +1236,7 @@ int main(int argc, char** argv) {
           for (size_t k = 0; k < NCAT; k++) if (catsum[k] > best) { best = catsum[k]; top = (int32_t)k; }
           std::fill(catsum.begin(), catsum.end(), 0);
         }
-        ur.push_back(URow{ref_p(ev[i].nref), ref_n(ev[i].nref), cur_day, u_sess, u_ev, u_rev, top});
+        ur.push(URow{ref_p(ev[i].nref), ref_n(ev[i].nref), cur_day, u_sess, u_ev, u_rev, top});
       };
       size_t k = i;
       while (k < j) {
@@ -1289,6 +1293,7 @@ int main(int argc, char** argv) {
     }
   });
 
+  parallel_for(NT, [&](size_t t, int) { urows[t].finish(); });
   lap("sessions");
   // ---- outputs
   string ud = outd + "/user_daily", cd = outd + "/campaign_daily";
@@ -1320,22 +1325,21 @@ int main(int argc, char** argv) {
   });
   parallel_for(NT, [&](size_t t, int) {
     auto& rs = urows[t];
-    if (rs.empty() && t != 0) return;
+    if (rs.total == 0 && t != 0) return;
     vector<Col> cols = {{"user_id", C_STR, {}, {}}, {"day", C_DATE, {}, {}}, {"sessions", C_I64, {}, {}},
                         {"events", C_I64, {}, {}}, {"revenue_cents", C_I64, {}, {}}, {"top_category", C_OPTSTR, {}, {}}};
     // exact sizes first, then fill through raw pointers (no per-value vector appends)
-    const size_t nr = rs.size();
+    const size_t nr = rs.total;
     size_t nb = 0, cb = 0;
-    for (auto& r : rs) { nb += 4 + r.n; if (r.top >= 0) cb += 4 + cat_names[r.top].size(); }
+    rs.each([&](const URow& r) { nb += 4 + r.n; if (r.top >= 0) cb += 4 + cat_names[r.top].size(); });
     cols[0].data.b.resize(nb); cols[1].data.b.resize(nr * 4);
     for (int k = 2; k < 5; k++) cols[k].data.b.resize(nr * 8);
     cols[5].data.b.resize(cb); cols[5].def.resize(nr);
     uint8_t* pn = cols[0].data.b.data(); uint8_t* pd = cols[1].data.b.data();
     uint8_t* ps = cols[2].data.b.data(); uint8_t* pe = cols[3].data.b.data(); uint8_t* pr = cols[4].data.b.data();
     uint8_t* pc = cols[5].data.b.data(); uint8_t* pdef = cols[5].def.data();
-    for (size_t i = 0; i < nr; i++) {
-      if (i + 8 < nr) __builtin_prefetch(rs[i + 8].name);
-      const URow& r = rs[i];
+    size_t i = 0;
+    rs.each([&](const URow& r) {
       memcpy(pn, &r.n, 4); memcpy(pn + 4, r.name, r.n); pn += 4 + r.n;
       memcpy(pd + 4 * i, &r.day, 4);
       memcpy(ps + 8 * i, &r.sessions, 8); memcpy(pe + 8 * i, &r.events, 8); memcpy(pr + 8 * i, &r.rev, 8);
@@ -1343,8 +1347,9 @@ int main(int argc, char** argv) {
         const string& c = cat_names[r.top]; u32 cl = (u32)c.size();
         memcpy(pc, &cl, 4); memcpy(pc + 4, c.data(), cl); pc += 4 + cl; pdef[i] = 1;
       } else pdef[i] = 0;
-    }
-    write_parquet(ud + "/part-" + std::to_string(t) + ".parquet", cols, (i64)rs.size());
+      i++;
+    });
+    write_parquet(ud + "/part-" + std::to_string(t) + ".parquet", cols, (i64)nr);
   });
   cw.join();
   lap("write");
