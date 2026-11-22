@@ -1238,7 +1238,7 @@ int main(int argc, char** argv) {
     for (u32 p = 0; p < P; p++) {
       Ev* e0 = ev.data() + sc.eoff[p]; Ev* e1 = ev.data() + sc.eoff[p + 1];
       if (e1 - e0 > 1) {
-        if (e1 - e0 <= 16) { for (Ev* x = e0 + 1; x < e1; x++) { Ev v = *x; Ev* y = x; while (y > e0 && v.ts < (y - 1)->ts) { *y = *(y - 1); y--; } *y = v; } }
+        if (e1 - e0 <= 32) { for (Ev* x = e0 + 1; x < e1; x++) { Ev v = *x; Ev* y = x; while (y > e0 && v.ts < (y - 1)->ts) { *y = *(y - 1); y--; } *y = v; } }
         else std::sort(e0, e1, ev_less);
       }
       Ck* c0 = ck.data() + sc.coff[p]; Ck* c1 = ck.data() + sc.coff[p + 1];
