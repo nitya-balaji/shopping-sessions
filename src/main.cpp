@@ -910,7 +910,7 @@ int main(int argc, char** argv) {
   lap("mapped");
 
   // ---- links: union-find (runs as one task while the other threads parse events and clicks)
-  struct PSlot { u64 h; u32 n; u32 used; const char* key; Person person; };  // 48 bytes
+  struct PSlot { u64 h; u32 n; u32 used; u64 pref; u64 ph; };  // 32 bytes: id hash/len -> person name ref + hash
   vector<PSlot> ptab;  // linked id -> person, one cache line per lookup
   u64 pmask = 0;
   auto do_links = [&]() {
@@ -966,12 +966,12 @@ int main(int argc, char** argv) {
     }
     vector<LS>().swap(lt);
     size_t pcap = 16; while (pcap < ids.size() * 2) pcap <<= 1;
-    ptab.assign(pcap, PSlot{0, 0, 0, nullptr, {nullptr, 0, 0}});
+    ptab.assign(pcap, PSlot{0, 0, 0, 0, 0});
     pmask = pcap - 1;
     for (u32 i = 0; i < ids.size(); i++) {
       u32 r = find(i);
       for (u64 j = hs[i] & pmask;; j = (j + 1) & pmask)
-        if (!ptab[j].used) { ptab[j] = PSlot{hs[i], ids[i].n, 1, ids[i].p, {ids[r].p, ids[r].n, hs[r]}}; break; }
+        if (!ptab[j].used) { ptab[j] = PSlot{hs[i], ids[i].n, 1, pack_ref(ids[r].p, ids[r].n), hs[r]}; break; }
     }
     if (PROF) fprintf(stderr, "links %zu ids %zu\n", np, ids.size());
     lap("links done");
@@ -980,7 +980,7 @@ int main(int argc, char** argv) {
     for (u64 j = h & pmask;; j = (j + 1) & pmask) {
       const PSlot& e = ptab[j];
       if (!e.used) return {p, n, h};
-      if (e.h == h && e.n == n) return e.person;  // 64-bit hash + length (see SOLUTION.md)
+      if (e.h == h && e.n == n) return {ref_p(e.pref), ref_n(e.pref), e.ph};  // 64-bit hash + length (see SOLUTION.md)
     }
   };
 
