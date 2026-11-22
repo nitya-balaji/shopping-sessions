@@ -960,7 +960,13 @@ int main(int argc, char** argv) {
     }
   };
 
-  const int S = 512;  // shards
+  // Shard count (power of two): enough that a dedup/session shard stays cache-sized, few enough that each
+  // parse thread's per-shard output lists stay in L2. Measured: 512 is best at 5M events; at the scorer's
+  // 20M+ a shard would be 4x larger, so use 1024 there (2048 is slower at any size).
+  size_t ev_bytes_all = 0;
+  for (auto& f : event_files) ev_bytes_all += f.n;
+  const int S = getenv("SS_SHARDS") ? atoi(getenv("SS_SHARDS")) : (ev_bytes_all / 90 > (size_t)10000000 ? 1024 : 512);
+  const u64 SM = (u64)S - 1;
   struct CRaw { u64 uh; const char* cid; u32 ts; u32 camp; uint16_t uid_n, cid_n; u32 pad; };  // 32 bytes
   vector<BList<CRaw>> cr_buf(NT);
   vector<vector<BList<ERaw>>> er_buf(NT, vector<BList<ERaw>>(S));
@@ -1039,7 +1045,7 @@ int main(int argc, char** argv) {
             r.uref = pack_ref(keep_str(f[1].p, f[1].n), f[1].n);
             r.ts = (u32)(ts - TBASE); r.pk = price | ((u32)type << 24) | (1u << 26);
           } while (0);
-          out[(r.h_eid >> 7) % S].push(r);
+          out[(r.h_eid >> 7) & SM].push(r);
         });
       }
     });
@@ -1067,7 +1073,7 @@ int main(int argc, char** argv) {
           if (k + PF < b->n) __builtin_prefetch(&ptab[b->items()[k + PF].uh & pmask]);
           const CRaw& c = b->items()[k];
           Person pp = resolve(c.uh, nullptr, c.uid_n);
-          out[pp.h % S].push(Ck{pp.h, c.cid, c.ts, c.camp, c.cid_n, (uint16_t)pp.n, 0});
+          out[pp.h & SM].push(Ck{pp.h, c.cid, c.ts, c.camp, c.cid_n, (uint16_t)pp.n, 0});
         }
       }
       in.recycle();
@@ -1122,7 +1128,7 @@ int main(int argc, char** argv) {
       if (k + PF < w) __builtin_prefetch(&ptab[hv[k + PF] & pmask]);
       const ERaw* r = &at(occ[k]);
       Person pp = resolve(hv[k], ref_p(r->uref), ref_n(r->uref));
-      out[pp.h % S].push(Ev{pp.h, pack_ref(pp.p, pp.n), r->ts, r->pk & 0xFFFFFF, r->cat, (uint8_t)((r->pk >> 24) & 3), 0});
+      out[pp.h & SM].push(Ev{pp.h, pack_ref(pp.p, pp.n), r->ts, r->pk & 0xFFFFFF, r->cat, (uint8_t)((r->pk >> 24) & 3), 0});
     }
     for (int t = 0; t < NT; t++) er_buf[t][s].recycle();  // blocks go back to this thread for later Ev pushes
   });
@@ -1165,7 +1171,7 @@ int main(int argc, char** argv) {
     sc.ptab.assign(cap, PKey{0, 0, UINT32_MAX});
     sc.epid.resize(ne); sc.cnt.clear();
     auto pfind = [&](u64 h, u32 n, bool insert) -> u32 {
-      for (u64 j = (h >> 9) & m;; j = (j + 1) & m) {
+      for (u64 j = (h >> 24) & m;; j = (j + 1) & m) {
         PKey& e = sc.ptab[j];
         if (e.id == UINT32_MAX) {
           if (!insert) return UINT32_MAX;
@@ -1177,7 +1183,7 @@ int main(int argc, char** argv) {
             sc.ptab.assign(cap, PKey{0, 0, UINT32_MAX});
             for (const PKey& o : old)
               if (o.id != UINT32_MAX)
-                for (u64 k = (o.h >> 9) & m;; k = (k + 1) & m)
+                for (u64 k = (o.h >> 24) & m;; k = (k + 1) & m)
                   if (sc.ptab[k].id == UINT32_MAX) { sc.ptab[k] = o; break; }
           }
           return id;
