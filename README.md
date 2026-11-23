@@ -1,6 +1,6 @@
 # Shopping Sessions
 
-**An entry for the "Shopping Sessions" track of the [joinbuilders.org Buildathon](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions).**
+**An entry for the Databricks "Shopping Sessions" track of the [Builder's Buildathon](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions).**
 
 The task is to turn a large, messy log of website activity into two clean daily reports, as fast as possible. Our solution is one C++ program that does the whole job in about a second on 20 million events. The organizers' Python starter took about 173 seconds on the same data.
 
