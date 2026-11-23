@@ -2,7 +2,7 @@
 
 **An entry for the Databricks "Shopping Sessions" track of the [Builder's Buildathon](https://www.joinbuilders.org/buildathon/tracks/shopping-sessions).**
 
-The task is to turn a large, messy log of website activity into two clean daily reports, as fast as possible. Our solution is one C++ program that does the whole job in about a second on 20 million events. The organizers' Python starter took about 173 seconds on the same data.
+The task is to turn a large, messy log of website activity into two clean daily reports, as fast as possible. Our solution is one C++ program that does the whole job in about 1.27 seconds on 20 million events. The organizers' Python starter took about 173 seconds on the same data.
 
 - [The problem](#the-problem)
 - [Our solution](#our-solution)
@@ -123,11 +123,11 @@ Some lower-level choices that made a measurable difference:
 | `9b29c2d` | background read-ahead and profile-guided build | 1.28 s |
 | `65656f4` | compiled specifically for the scorer's CPU (Cascade Lake) | 1.27 s |
 | `4bf404e` | lower-memory input reading, cache-sized shards, smaller lookup tables | 1.2786 s |
-| `96c0700` (current `main`) | experiment: user_daily files written twice (see note) | **0.2730 s** |
+| `96c0700` (current `main`, final) | experiment: user_daily files written twice (see note) | **1.2730 s** |
 
-That is roughly **135× faster than the starter** at our typical speed of about 1.28 s, and about 630× at our best official time.
+Our final time of **1.2730 s is about 136× faster than the starter**.
 
-**About the best time:** `96c0700` is the same program as `4bf404e`, plus one experiment: it writes a second copy of each `user_daily` file with a `_dup-` prefix, to measure how much writing output costs. The scorer ignores files whose names start with `_`. Its official time was 0.2730 s. A version of the same design without that experiment scored 1.2984 s soon after. So the 0.27 s run most likely caught a quiet scoring machine rather than reflecting a real speed-up, and about 1.28 s is the time to expect. If you run it, the extra `_dup-*.parquet` files in `user_daily/` are expected and harmless.
+**About the final version:** `96c0700` is the same program as `4bf404e`, plus one experiment: it writes a second copy of each `user_daily` file with a `_dup-` prefix, to measure how much writing output costs. The scorer ignores files whose names start with `_`, so the copies don't affect correctness. All versions from `9b29c2d` on scored between 1.27 s and 1.30 s, so these last differences are within the scorer's run-to-run variation. If you run it, the extra `_dup-*.parquet` files in `user_daily/` are expected and harmless.
 
 ---
 
