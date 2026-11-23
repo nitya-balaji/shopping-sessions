@@ -39,7 +39,7 @@ The program reads a folder of CSV files (comma-separated text):
 
 ### What makes it hard
 
-The full rules are in [`rules.md`](rules.md), and they are strict: the output must match the answer key exactly, row for row. In plain terms:
+The full rules are in [`rules.md`](rules.md), and they were strictly followed within the solution. The output must match the answer key exactly, row for row. In plain terms:
 
 - **One person, many IDs.** A shopper can appear under several user IDs (cleared cookies, a second device). The `links` files say which IDs belong together, and the chains can run hundreds of links long. Every count is per *person*, not per ID.
 - **Duplicates.** Many events were recorded more than once. Only the earliest-recorded copy counts, even if it turns out to be invalid and a later copy looks fine.
