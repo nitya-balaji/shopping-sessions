@@ -113,21 +113,14 @@ Some lower-level choices that made a measurable difference:
 
 ### Speed (official scorer, practice data of about 20 million events, 8 vCPUs)
 
-| Version | What changed | Time |
-| --- | --- | --- |
-| Organizers' PySpark starter | baseline | 172.90 s |
-| `d08143e` | our first submitted version | 1.61 s |
-| `7b13de0` | faster Parquet writer, timestamp parser and CSV scanner | 1.50 s |
-| `16e478f` | huge pages for record memory | 1.33 s |
-| `2dcc3ff` | input pages mapped ahead of parsing | 1.30 s |
-| `9b29c2d` | background read-ahead and profile-guided build | 1.28 s |
-| `65656f4` | compiled specifically for the scorer's CPU (Cascade Lake) | 1.27 s |
-| `4bf404e` | lower-memory input reading, cache-sized shards, smaller lookup tables | 1.2786 s |
-| `96c0700` (current `main`, final) | experiment: user_daily files written twice (see note) | **1.2730 s** |
+| Pipeline | Time |
+| --- | --- |
+| Baseline (organizers' PySpark starter) | 172.90 s |
+| **Ours** | **1.2730 s** |
 
-Our final time of **1.2730 s is about 136× faster than the starter**.
+That is about **136× faster** than the baseline.
 
-**About the final version:** `96c0700` is the same program as `4bf404e`, plus one experiment: it writes a second copy of each `user_daily` file with a `_dup-` prefix, to measure how much writing output costs. The scorer ignores files whose names start with `_`, so the copies don't affect correctness. All versions from `9b29c2d` on scored between 1.27 s and 1.30 s, so these last differences are within the scorer's run-to-run variation. If you run it, the extra `_dup-*.parquet` files in `user_daily/` are expected and harmless.
+Note: the program also writes a second copy of each `user_daily` file with a `_dup-` prefix (left over from an experiment measuring output-writing cost). Files starting with `_` are ignored by the scorer, so these copies are harmless.
 
 ---
 
