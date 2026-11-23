@@ -116,7 +116,7 @@ Some lower-level choices that made a measurable difference:
 | Pipeline | Time |
 | --- | --- |
 | Baseline (organizers' PySpark starter) | 172.90 s |
-| **Ours** | **1.2730 s** |
+| **This solution (C++)** | **1.2730 s** |
 
 That is about **136× faster** than the baseline.
 
